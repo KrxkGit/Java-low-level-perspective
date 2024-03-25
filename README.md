@@ -2,6 +2,8 @@
 
 本文档以 **大学计算机本科课程** 为出发点，一窥 Java 库代码的实现，将 **理论与开发实践** 进行紧密结合。文档中源代码源于 **JDK-19**。
 
+另外，本文档涉及 JVM 的一些底层实现，并尽量基于源码追踪 (基于OpenJDK C++ 源码)的方式去挖掘实现原理。
+
 ​																			——**狂刄星空**
 
 ### 🖊线性表
@@ -3329,11 +3331,28 @@ static class Node<K,V> implements Map.Entry<K,V> {
 
 对于红黑树转换，先建立红黑树副本，然后将树引用替换拉链引用。
 
-## 🖊内存
+## ✨内存管理
 
-### 📝garbage collect 机制
+### 📝搭建 JDK 源码阅读环境
+
+要更好地理解 Java 底层，难以避免地接触到 native 方法、hotspot 底层实现，这时候不得不查看 JDK 底层源码。*OpenJDK* 是开源的，故可以通过查看该源码进行观察。
+
+为了更好地阅读源码，难以避免接触到源码的编译，因为如果无法编译源码，大多数阅读环境是基于**符号查找**的方式跳转的，这并不十分准确。而通过编译，生成 **编译数据库 ( compile_commands.json )** 文件可以极大程度改善这个问题。
+
+**OpenJDK** 的理想编译环境是 **Linux**，由于源码采用 **Makefile** 机制，故可基于 **Bear** 生成 **compile_commands.json** 文件。可采用如下命令：
+
+> bear -- ./configure  --disable-javac-server
+> bear -- make
+
+完成编译并生成 compile_commands.json
+
+另外，由于编译 JDK 需要编译 JDK 中的 Java源码，故需要一个**预先装好的JDK ( 引导JDK )** ,一般可选择与编译目标JDK 版本相近甚至相同的 JDK 版本。
+
+### 📝Garbage collect 机制
 
 Java 内存回收机制包含静态内存回收机制与动态内存回收机制，前者在编译期即可确定，故回收策略较简单，分配的内存在**栈**上；后者较为复杂，内存一般在**堆**上分配，需要在运行时期确定内存回收时期。
+
+*栈一般是线程独占的，堆是进程独占的。*
 
 #### 垃圾的检测
 
@@ -3367,6 +3386,1211 @@ Java 是基于引用依赖关系来确定内存对象是否被视为垃圾的，
 > 2. 当 Survivor 区存不下 Minor gc 后仍存活的对象，将其移动到 Old 区；或者 Survivor 中足够老的对象，也移动到 Old 区
 > 3. Old 区满后，触发 Full gc，回收整个堆的内存。
 > 4. Perm 区 的垃圾回收也是由 Full gc 触发的。
+
+针对堆不同的区域，hotspot 采用不同的垃圾回收策略，截至 **OpenJDK-21**，支持
+
+> 1. epsilon
+> 2. g1
+> 3. parallel
+> 4. serial
+> 5. shenandoah
+> 6. z
+
+垃圾回收算法。接下来将详细介绍。
+
+#### Java new 语法的底层实现
+
+##### 总体步骤
+
+当使用 new 关键字创建一个对象时，将调用底层如下实现：
+
+```c++
+// Allocation
+
+JRT_ENTRY(void, InterpreterRuntime::_new(JavaThread* current, ConstantPool* pool, int index))
+  Klass* k = pool->klass_at(index, CHECK); // 从常量池找到类型
+  InstanceKlass* klass = InstanceKlass::cast(k);
+
+  // Make sure we are not instantiating an abstract klass
+  klass->check_valid_for_instantiation(true, CHECK);
+
+  // Make sure klass is initialized
+  klass->initialize(CHECK);
+
+  // At this point the class may not be fully initialized
+  // because of recursive initialization. If it is fully
+  // initialized & has_finalized is not set, we rewrite
+  // it into its fast version (Note: no locking is needed
+  // here since this is an atomic byte write and can be
+  // done more than once).
+  //
+  // Note: In case of classes with has_finalized we don't
+  //       rewrite since that saves us an extra check in
+  //       the fast version which then would call the
+  //       slow version anyway (and do a call back into
+  //       Java).
+  //       If we have a breakpoint, then we don't rewrite
+  //       because the _breakpoint bytecode would be lost.
+  oop obj = klass->allocate_instance(CHECK);
+  current->set_vm_result(obj);
+JRT_END
+```
+
+##### 类型初始化
+
+其中 **Klass** 类型表明要创建的 Java对象 的类型，从下列代码也可分析得到 Java 支持的对象类型。JVM 首先从常量池找到 该对象的类型，且进行一定的类型转换，并确保 klass 初始化完成
+
+```c++
+class Klass : public Metadata {
+  friend class VMStructs;
+  friend class JVMCIVMStructs;
+ public:
+  // Klass Kinds for all subclasses of Klass
+  enum KlassKind {
+    InstanceKlassKind,
+    InstanceRefKlassKind,
+    InstanceMirrorKlassKind,
+    InstanceClassLoaderKlassKind,
+    InstanceStackChunkKlassKind,
+    TypeArrayKlassKind,
+    ObjArrayKlassKind,
+    UnknownKlassKind
+  };
+  // ...
+}
+```
+
+类型初始化代码如下：
+
+```c++
+void InstanceKlass::initialize(TRAPS) {
+  if (this->should_be_initialized()) {
+    initialize_impl(CHECK);
+    // Note: at this point the class may be initialized
+    //       OR it may be in the state of being initialized
+    //       in case of recursive initialization!
+  } else {
+    assert(is_initialized(), "sanity check");
+  }
+}
+```
+
+```c++
+void InstanceKlass::initialize_impl(TRAPS) {
+  HandleMark hm(THREAD);
+
+  // Make sure klass is linked (verified) before initialization
+  // A class could already be verified, since it has been reflected upon.
+  link_class(CHECK);
+
+  DTRACE_CLASSINIT_PROBE(required, -1);
+
+  bool wait = false;
+  bool throw_error = false;
+
+  JavaThread* jt = THREAD;
+
+  bool debug_logging_enabled = log_is_enabled(Debug, class, init);
+
+  // refer to the JVM book page 47 for description of steps
+  // Step 1
+  {
+    MonitorLocker ml(jt, _init_monitor);
+
+    // Step 2
+    while (is_being_initialized() && !is_init_thread(jt)) {
+      if (debug_logging_enabled) {
+        ResourceMark rm(jt);
+        log_debug(class, init)("Thread \"%s\" waiting for initialization of %s by thread \"%s\"",
+                               jt->name(), external_name(), init_thread_name());
+      }
+
+      wait = true;
+      jt->set_class_to_be_initialized(this);
+      ml.wait();
+      jt->set_class_to_be_initialized(nullptr);
+    }
+
+    // Step 3
+    if (is_being_initialized() && is_init_thread(jt)) {
+      if (debug_logging_enabled) {
+        ResourceMark rm(jt);
+        log_debug(class, init)("Thread \"%s\" recursively initializing %s",
+                               jt->name(), external_name());
+      }
+      DTRACE_CLASSINIT_PROBE_WAIT(recursive, -1, wait);
+      return;
+    }
+
+    // Step 4
+    if (is_initialized()) {
+      if (debug_logging_enabled) {
+        ResourceMark rm(jt);
+        log_debug(class, init)("Thread \"%s\" found %s already initialized",
+                               jt->name(), external_name());
+      }
+      DTRACE_CLASSINIT_PROBE_WAIT(concurrent, -1, wait);
+      return;
+    }
+
+    // Step 5
+    if (is_in_error_state()) {
+      if (debug_logging_enabled) {
+        ResourceMark rm(jt);
+        log_debug(class, init)("Thread \"%s\" found %s is in error state",
+                               jt->name(), external_name());
+      }
+      throw_error = true;
+    } else {
+
+      // Step 6
+      set_init_state(being_initialized);
+      set_init_thread(jt);
+      if (debug_logging_enabled) {
+        ResourceMark rm(jt);
+        log_debug(class, init)("Thread \"%s\" is initializing %s",
+                               jt->name(), external_name());
+      }
+    }
+  }
+
+  // Throw error outside lock
+  if (throw_error) {
+    DTRACE_CLASSINIT_PROBE_WAIT(erroneous, -1, wait);
+    ResourceMark rm(THREAD);
+    Handle cause(THREAD, get_initialization_error(THREAD));
+
+    stringStream ss;
+    ss.print("Could not initialize class %s", external_name());
+    if (cause.is_null()) {
+      THROW_MSG(vmSymbols::java_lang_NoClassDefFoundError(), ss.as_string());
+    } else {
+      THROW_MSG_CAUSE(vmSymbols::java_lang_NoClassDefFoundError(),
+                      ss.as_string(), cause);
+    }
+  }
+
+  // Step 7
+  // Next, if C is a class rather than an interface, initialize it's super class and super
+  // interfaces.
+  if (!is_interface()) {
+    Klass* super_klass = super();
+    if (super_klass != nullptr && super_klass->should_be_initialized()) {
+      super_klass->initialize(THREAD);
+    }
+    // If C implements any interface that declares a non-static, concrete method,
+    // the initialization of C triggers initialization of its super interfaces.
+    // Only need to recurse if has_nonstatic_concrete_methods which includes declaring and
+    // having a superinterface that declares, non-static, concrete methods
+    if (!HAS_PENDING_EXCEPTION && has_nonstatic_concrete_methods()) {
+      initialize_super_interfaces(THREAD);
+    }
+
+    // If any exceptions, complete abruptly, throwing the same exception as above.
+    if (HAS_PENDING_EXCEPTION) {
+      Handle e(THREAD, PENDING_EXCEPTION);
+      CLEAR_PENDING_EXCEPTION;
+      {
+        EXCEPTION_MARK;
+        add_initialization_error(THREAD, e);
+        // Locks object, set state, and notify all waiting threads
+        set_initialization_state_and_notify(initialization_error, THREAD);
+        CLEAR_PENDING_EXCEPTION;
+      }
+      DTRACE_CLASSINIT_PROBE_WAIT(super__failed, -1, wait);
+      THROW_OOP(e());
+    }
+  }
+
+
+  // Step 8
+  {
+    DTRACE_CLASSINIT_PROBE_WAIT(clinit, -1, wait);
+    if (class_initializer() != nullptr) {
+      // Timer includes any side effects of class initialization (resolution,
+      // etc), but not recursive entry into call_class_initializer().
+      PerfClassTraceTime timer(ClassLoader::perf_class_init_time(),
+                               ClassLoader::perf_class_init_selftime(),
+                               ClassLoader::perf_classes_inited(),
+                               jt->get_thread_stat()->perf_recursion_counts_addr(),
+                               jt->get_thread_stat()->perf_timers_addr(),
+                               PerfClassTraceTime::CLASS_CLINIT);
+      call_class_initializer(THREAD);
+    } else {
+      // The elapsed time is so small it's not worth counting.
+      if (UsePerfData) {
+        ClassLoader::perf_classes_inited()->inc();
+      }
+      call_class_initializer(THREAD);
+    }
+  }
+
+  // Step 9
+  if (!HAS_PENDING_EXCEPTION) {
+    set_initialization_state_and_notify(fully_initialized, THREAD);
+    debug_only(vtable().verify(tty, true);)
+  }
+  else {
+    // Step 10 and 11
+    Handle e(THREAD, PENDING_EXCEPTION);
+    CLEAR_PENDING_EXCEPTION;
+    // JVMTI has already reported the pending exception
+    // JVMTI internal flag reset is needed in order to report ExceptionInInitializerError
+    JvmtiExport::clear_detected_exception(jt);
+    {
+      EXCEPTION_MARK;
+      add_initialization_error(THREAD, e);
+      set_initialization_state_and_notify(initialization_error, THREAD);
+      CLEAR_PENDING_EXCEPTION;   // ignore any exception thrown, class initialization error is thrown below
+      // JVMTI has already reported the pending exception
+      // JVMTI internal flag reset is needed in order to report ExceptionInInitializerError
+      JvmtiExport::clear_detected_exception(jt);
+    }
+    DTRACE_CLASSINIT_PROBE_WAIT(error, -1, wait);
+    if (e->is_a(vmClasses::Error_klass())) {
+      THROW_OOP(e());
+    } else {
+      JavaCallArguments args(e);
+      THROW_ARG(vmSymbols::java_lang_ExceptionInInitializerError(),
+                vmSymbols::throwable_void_signature(),
+                &args);
+    }
+  }
+  DTRACE_CLASSINIT_PROBE_WAIT(end, -1, wait);
+}
+```
+
+从源代码可观察到，算法分为 11 步实现：
+
+> 1. 加锁以避免多线程并发初始化
+> 2. 如果其他线程正在初始化该类型，等待其完成并通知。
+> 3. 若初始化已开始，则直接返回。此步用于解决循环对象引用的问题。
+> 4. 若初始化已完成，直接返回。
+> 5. 若初始化发送异常，报错返回。
+> 6. 设置初始化状态，设置执行初始化的线程为当前线程。
+> 7. 若对象类型非接口类型，则执行其父类型、父接口类型的初始化。
+> 8. 通过 call_class_initializer() 执行对象的静态代码
+> 9. 若初始化过程无异常，通知其他线程初始化已完成。
+> 10. 若初始化过程存在异常，通知其他线程初始化发送异常。
+
+##### 在堆上创建  instanceOopDesc 对象
+
+当对象类型初始化完成，在堆上创建 **instanceOopDesc 对象**。其中 TRAPS 定义如下，在源码中十分常见。
+
+> \#define TRAPS  JavaThread* THREAD
+
+```c++
+instanceOop InstanceKlass::allocate_instance(TRAPS) {
+  bool has_finalizer_flag = has_finalizer(); // Query before possible GC
+  size_t size = size_helper();  // Query before forming handle.
+
+  instanceOop i;
+
+  i = (instanceOop)Universe::heap()->obj_allocate(this, size, CHECK_NULL);
+  if (has_finalizer_flag && !RegisterFinalizersAtInit) {
+    i = register_finalizer(i, CHECK_NULL);
+  }
+  return i;
+}
+```
+
+```c++
+// An instanceOop is an instance of a Java Class
+// Evaluating "new HashTable()" will create an instanceOop.
+
+class instanceOopDesc : public oopDesc {
+ public:
+  // aligned header size.
+  static int header_size() { return sizeof(instanceOopDesc)/HeapWordSize; }
+
+  // If compressed, the offset of the fields of the instance may not be aligned.
+  static int base_offset_in_bytes() {
+    return (UseCompressedClassPointers) ?
+            klass_gap_offset_in_bytes() :
+            sizeof(instanceOopDesc);
+
+  }
+};
+```
+
+instanceOopDesc 继承自 oopDesc，后者属性字段如下：
+
+```c++
+class oopDesc {
+  friend class VMStructs;
+  friend class JVMCIVMStructs;
+ private:
+  volatile markWord _mark;
+  union _metadata {
+    Klass*      _klass;
+    narrowKlass _compressed_klass;
+  } _metadata;
+```
+
+其中 markWord 类型记录了对象的基本信息如 hash 值、gc 分代年龄等
+
+```c++
+class markWord {
+ private:
+  uintptr_t _value;
+
+ public:
+  // Constants
+  static const int age_bits                       = 4;
+  static const int lock_bits                      = 2;
+  static const int first_unused_gap_bits          = 1;
+  static const int max_hash_bits                  = BitsPerWord - age_bits - lock_bits - first_unused_gap_bits;
+  static const int hash_bits                      = max_hash_bits > 31 ? 31 : max_hash_bits;
+  static const int second_unused_gap_bits         = LP64_ONLY(1) NOT_LP64(0);
+
+  static const int lock_shift                     = 0;
+  static const int age_shift                      = lock_bits + first_unused_gap_bits;
+  static const int hash_shift                     = age_shift + age_bits + second_unused_gap_bits;
+
+  static const uintptr_t lock_mask                = right_n_bits(lock_bits);
+  static const uintptr_t lock_mask_in_place       = lock_mask << lock_shift;
+  static const uintptr_t age_mask                 = right_n_bits(age_bits);
+  static const uintptr_t age_mask_in_place        = age_mask << age_shift;
+  static const uintptr_t hash_mask                = right_n_bits(hash_bits);
+  static const uintptr_t hash_mask_in_place       = hash_mask << hash_shift;
+
+  static const uintptr_t locked_value             = 0;
+  static const uintptr_t unlocked_value           = 1;
+  static const uintptr_t monitor_value            = 2;
+  static const uintptr_t marked_value             = 3;
+
+  static const uintptr_t no_hash                  = 0 ;  // no hash value assigned
+  static const uintptr_t no_hash_in_place         = (uintptr_t)no_hash << hash_shift;
+  static const uintptr_t no_lock_in_place         = unlocked_value;
+
+  static const uint max_age                       = age_mask;
+  // ...
+  uint age() const { return (uint) mask_bits(value() >> age_shift, age_mask); }
+  markWord set_age(uint v) const {
+    assert((v & ~age_mask) == 0, "shouldn't overflow age field");
+    return markWord((value() & ~age_mask_in_place) | ((v & age_mask) << age_shift));
+  }
+  markWord incr_age()      const { return age() == max_age ? markWord(_value) : set_age(age() + 1); }
+
+  // hash operations
+  intptr_t hash() const {
+    return mask_bits(value() >> hash_shift, hash_mask);
+  }
+    
+  // ...
+}
+```
+
+```c++
+inline intptr_t mask_bits (intptr_t  x, intptr_t m) { return x & m; }
+#define nth_bit(n)        (((n) >= BitsPerWord) ? 0 : (OneBit << (n)))
+#define right_n_bits(n)   (nth_bit(n) - 1)
+```
+
+代码中涉及 Java 常量类型的大小，定义如下 (基于位运算)：
+
+```c++
+const int LogBytesPerShort   = 1;
+const int LogBytesPerInt     = 2;
+#ifdef _LP64
+const int LogBytesPerWord    = 3;
+#else
+const int LogBytesPerWord    = 2;
+#endif
+const int LogBytesPerLong    = 3;
+
+const int BytesPerShort      = 1 << LogBytesPerShort;
+const int BytesPerInt        = 1 << LogBytesPerInt;
+const int BytesPerWord       = 1 << LogBytesPerWord;
+const int BytesPerLong       = 1 << LogBytesPerLong;
+
+const int LogBitsPerByte     = 3;
+const int LogBitsPerShort    = LogBitsPerByte + LogBytesPerShort;
+const int LogBitsPerInt      = LogBitsPerByte + LogBytesPerInt;
+const int LogBitsPerWord     = LogBitsPerByte + LogBytesPerWord;
+const int LogBitsPerLong     = LogBitsPerByte + LogBytesPerLong;
+
+const int BitsPerByte        = 1 << LogBitsPerByte;
+const int BitsPerShort       = 1 << LogBitsPerShort;
+const int BitsPerInt         = 1 << LogBitsPerInt;
+const int BitsPerWord        = 1 << LogBitsPerWord;
+const int BitsPerLong        = 1 << LogBitsPerLong;
+```
+
+从源码中还可看出，hash_shift 与 gc 代数有关，*故相同 value 的不同代的对象 hashcode 可能不一致*。
+
+另外值得注意的是：在堆上分配空间前，还会查询类是否含有 finalize 方法，如果有会将其注册，执行 gc 时会调用 finalize 方法。
+
+##### 📗分配空间
+
+最后就是在堆上分配合适大小的空间，即
+
+> i = (instanceOop)Universe::heap()->obj_allocate(this, size, CHECK_NULL);
+
+其中 **Universe** 用于保存 JVM 重要的系统类与实例。
+
+```c++
+class Universe: AllStatic {
+  // Ugh.  Universe is much too friendly.
+  friend class MarkSweep;
+  friend class oopDesc;
+  friend class ClassLoader;
+  friend class SystemDictionary;
+  friend class ReservedHeapSpace;
+  friend class VMStructs;
+  friend class VM_PopulateDumpSharedSpace;
+  friend class Metaspace;
+  friend class MetaspaceShared;
+  friend class vmClasses;
+
+  friend jint  universe_init();
+  friend void  universe2_init();
+  friend bool  universe_post_init();
+  friend void  universe_post_module_init();
+
+ private:
+  // Known classes in the VM
+  static Klass* _typeArrayKlassObjs[T_LONG+1];
+  static Klass* _objectArrayKlassObj;
+  // Special int-Array that represents filler objects that are used by GC to overwrite
+  // dead objects. References to them are generally an error.
+  static Klass* _fillerArrayKlassObj;
+
+  // Known objects in the VM
+  static OopHandle    _main_thread_group;             // Reference to the main thread group object
+  static OopHandle    _system_thread_group;           // Reference to the system thread group object
+
+  static OopHandle    _the_empty_class_array;         // Canonicalized obj array of type java.lang.Class
+  static OopHandle    _the_null_string;               // A cache of "null" as a Java string
+  static OopHandle    _the_min_jint_string;           // A cache of "-2147483648" as a Java string
+
+  static OopHandle    _the_null_sentinel;             // A unique object pointer unused except as a sentinel for null.
+
+  // preallocated error objects (no backtrace)
+  static OopHandle    _out_of_memory_errors;
+  static OopHandle    _class_init_stack_overflow_error;
+
+  // preallocated cause message for delayed StackOverflowError
+  static OopHandle    _delayed_stack_overflow_error_message;
+
+  static LatestMethodCache* _finalizer_register_cache; // static method for registering finalizable objects
+  static LatestMethodCache* _loader_addClass_cache;    // method for registering loaded classes in class loader vector
+  static LatestMethodCache* _throw_illegal_access_error_cache; // Unsafe.throwIllegalAccessError() method
+  static LatestMethodCache* _throw_no_such_method_error_cache; // Unsafe.throwNoSuchMethodError() method
+  static LatestMethodCache* _do_stack_walk_cache;      // method for stack walker callback
+
+  static Array<int>*            _the_empty_int_array;            // Canonicalized int array
+  static Array<u2>*             _the_empty_short_array;          // Canonicalized short array
+  static Array<Klass*>*         _the_empty_klass_array;          // Canonicalized klass array
+  static Array<InstanceKlass*>* _the_empty_instance_klass_array; // Canonicalized instance klass array
+  static Array<Method*>*        _the_empty_method_array;         // Canonicalized method array
+
+  static Array<Klass*>*  _the_array_interfaces_array;
+
+  // array of preallocated error objects with backtrace
+  static OopHandle     _preallocated_out_of_memory_error_array;
+
+  // number of preallocated error objects available for use
+  static volatile jint _preallocated_out_of_memory_error_avail_count;
+
+  // preallocated message detail strings for error objects
+  static OopHandle _msg_metaspace;
+  static OopHandle _msg_class_metaspace;
+
+  static OopHandle    _null_ptr_exception_instance;   // preallocated exception object
+  static OopHandle    _arithmetic_exception_instance; // preallocated exception object
+  static OopHandle    _virtual_machine_error_instance; // preallocated exception object
+
+  // References waiting to be transferred to the ReferenceHandler
+  static OopHandle    _reference_pending_list;
+  // ...
+}
+```
+
+根据 Universe 保存的 Heap 调用 CollectedHeap 类的方法如下：
+
+```c++
+inline oop CollectedHeap::obj_allocate(Klass* klass, size_t size, TRAPS) {
+  ObjAllocator allocator(klass, size, THREAD);
+  return allocator.allocate();
+}
+```
+
+上述代码中的 ObjAllocator 简单地封装了对象需要执行的初始化函数
+
+```c++
+class ObjAllocator: public MemAllocator {
+public:
+  ObjAllocator(Klass* klass, size_t word_size, Thread* thread = Thread::current())
+    : MemAllocator(klass, word_size, thread) {}
+
+  virtual oop initialize(HeapWord* mem) const;
+};
+```
+
+###### MemAllocator::allocate
+
+接下来是调用 *MemAllocator::allocate* 方法
+
+```c++
+oop MemAllocator::allocate() const {
+  oop obj = nullptr;
+  {
+    Allocation allocation(*this, &obj);
+    HeapWord* mem = mem_allocate(allocation);
+    if (mem != nullptr) {
+      obj = initialize(mem);
+    } else {
+      // The unhandled oop detector will poison local variable obj,
+      // so reset it to null if mem is null.
+      obj = nullptr;
+    }
+  }
+  return obj;
+}
+
+HeapWord* MemAllocator::mem_allocate(Allocation& allocation) const {
+  if (UseTLAB) {
+    // Try allocating from an existing TLAB.
+    HeapWord* mem = mem_allocate_inside_tlab_fast();
+    if (mem != nullptr) {
+      return mem;
+    }
+  }
+
+  return mem_allocate_slow(allocation);
+}
+```
+
+###### tlab 快分配
+
+```c++
+// 快速 tlab，直接在 tlab 分配
+HeapWord* MemAllocator::mem_allocate_inside_tlab_fast() const {
+  return _thread->tlab().allocate(_word_size);
+}
+
+inline HeapWord* ThreadLocalAllocBuffer::allocate(size_t size) {
+  invariants();
+  HeapWord* obj = top();
+  if (pointer_delta(end(), obj) >= size) {
+    // successful thread-local allocation
+#ifdef ASSERT
+    // Skip mangling the space corresponding to the object header to
+    // ensure that the returned space is not considered parsable by
+    // any concurrent GC thread.
+    size_t hdr_size = oopDesc::header_size();
+    Copy::fill_to_words(obj + hdr_size, size - hdr_size, badHeapWordVal);
+#endif // ASSERT
+    // This addition is safe because we know that top is
+    // at least size below end, so the add can't wrap.
+    set_top(obj + size);
+
+    invariants();
+    return obj;
+  }
+  return nullptr;
+}
+```
+
+###### tlab 慢分配
+
+```c++
+// 慢速 tlab，尝试申请新的 tlab 再分配 或 直接在 Eden 区分配
+HeapWord* MemAllocator::mem_allocate_slow(Allocation& allocation) const {
+  // Allocation of an oop can always invoke a safepoint.
+  debug_only(allocation._thread->check_for_valid_safepoint_state());
+
+  if (UseTLAB) {
+    // Try refilling the TLAB and allocating the object in it.
+    HeapWord* mem = mem_allocate_inside_tlab_slow(allocation);
+    if (mem != nullptr) {
+      return mem;
+    }
+  }
+
+  return mem_allocate_outside_tlab(allocation);
+}
+
+HeapWord* MemAllocator::mem_allocate_inside_tlab_slow(Allocation& allocation) const {
+  HeapWord* mem = nullptr;
+  ThreadLocalAllocBuffer& tlab = _thread->tlab();
+
+  if (JvmtiExport::should_post_sampled_object_alloc()) {
+    tlab.set_back_allocation_end();
+    mem = tlab.allocate(_word_size);
+
+    // We set back the allocation sample point to try to allocate this, reset it
+    // when done.
+    allocation._tlab_end_reset_for_sample = true;
+
+    if (mem != nullptr) {
+      return mem;
+    }
+  }
+
+  // Retain tlab and allocate object in shared space if
+  // the amount free in the tlab is too large to discard.
+  if (tlab.free() > tlab.refill_waste_limit()) {
+    tlab.record_slow_allocation(_word_size);
+    return nullptr;
+  }
+
+  // Discard tlab and allocate a new one.
+  // To minimize fragmentation, the last TLAB may be smaller than the rest.
+  size_t new_tlab_size = tlab.compute_size(_word_size);
+
+  tlab.retire_before_allocation();
+
+  if (new_tlab_size == 0) {
+    return nullptr;
+  }
+
+  // Allocate a new TLAB requesting new_tlab_size. Any size
+  // between minimal and new_tlab_size is accepted.
+  size_t min_tlab_size = ThreadLocalAllocBuffer::compute_min_size(_word_size);
+  mem = Universe::heap()->allocate_new_tlab(min_tlab_size, new_tlab_size, &allocation._allocated_tlab_size);
+  if (mem == nullptr) {
+    assert(allocation._allocated_tlab_size == 0,
+           "Allocation failed, but actual size was updated. min: " SIZE_FORMAT
+           ", desired: " SIZE_FORMAT ", actual: " SIZE_FORMAT,
+           min_tlab_size, new_tlab_size, allocation._allocated_tlab_size);
+    return nullptr;
+  }
+  assert(allocation._allocated_tlab_size != 0, "Allocation succeeded but actual size not updated. mem at: "
+         PTR_FORMAT " min: " SIZE_FORMAT ", desired: " SIZE_FORMAT,
+         p2i(mem), min_tlab_size, new_tlab_size);
+
+  if (ZeroTLAB) {
+    // ..and clear it.
+    Copy::zero_to_words(mem, allocation._allocated_tlab_size);
+  } else {
+    // ...and zap just allocated object.
+#ifdef ASSERT
+    // Skip mangling the space corresponding to the object header to
+    // ensure that the returned space is not considered parsable by
+    // any concurrent GC thread.
+    size_t hdr_size = oopDesc::header_size();
+    Copy::fill_to_words(mem + hdr_size, allocation._allocated_tlab_size - hdr_size, badHeapWordVal);
+#endif // ASSERT
+  }
+
+  tlab.fill(mem, mem + _word_size, allocation._allocated_tlab_size);
+  return mem;
+}
+```
+
+###### tlab 慢分配的两者策略
+
+JVM 尽可能地使用 **tlab** 机制，观察代码可知，针对 tlab 慢分配，有两种策略，而决策依据是 tlab 的最大浪费空间
+
+> tlab.refill_waste_limit()
+
+###### 直接在 Eden 区分配
+
+如果选择的是 "本次分配直接在 Eden 区分配，保留原来 tlab" 将调用下列核心函数：
+
+```c++
+HeapWord* MemAllocator::mem_allocate_outside_tlab(Allocation& allocation) const {
+  allocation._allocated_outside_tlab = true;
+  HeapWord* mem = Universe::heap()->mem_allocate(_word_size, &allocation._overhead_limit_exceeded);
+  if (mem == nullptr) {
+    return mem;
+  }
+
+  size_t size_in_bytes = _word_size * HeapWordSize;
+  _thread->incr_allocated_bytes(size_in_bytes);
+
+  return mem;
+}
+```
+
+其中
+
+> allocate_new_tlab  -> (慢速 tlab)
+>
+> mem_allocate -> (最慢 直接使用堆)
+
+是虚函数，将与 CollectedHeap 紧密关联，且由子类改写，是不同 内存管理器 的**公共申请内存接口**。
+
+#### 👀ThreadLocalAllocBuffer ( TLAB )
+
+上述分析涉及了 **tlab**，接下来将分析 tlab 以加深理解。
+
+##### TLAB 作用
+
+对于单线程应用，每次分配内存，会记录上次分配对象内存地址末尾的指针，之后分配对象会**从这个指针开始检索分配**。这个机制叫做 **bump-the-pointer** （撞针）。
+
+对于多线程应用来说，内存分配需要考虑线程安全。最直接的想法就是通过全局锁，但是这个性能会很差。为了优化这个性能，我们考虑可以每个线程分配一个线程本地私有的内存池，然后采用 bump-the-pointer 机制进行内存分配。这个线程本地私有的内存池，就是 TLAB。只有 TLAB 满了，再去申请内存的时候，需要扩充 TLAB 或者使用新的 TLAB，这时候才需要锁。这样大大减少了锁使用。
+
+
+故 TLAB 的目的是在为新对象分配内存空间时，让每个 Java 应用线程能在使用自己专属的分配指针来分配空间，均摊对GC 堆（eden区）里共享的分配指针做更新而带来的同步开销。
+
+TLAB只是让每个线程有私有的分配指针，但底下存对象的内存空间还是给所有线程访问的，只是其它线程无法在这个区域分配而已。当一个TLAB用满（分配指针top撞上分配极限end了），就新申请一个TLAB，而在老TLAB里的对象还留在原地什么都不用管——它们无法感知自己是否是曾经从TLAB分配出来的，而只关心自己是在 eden 里分配的。
+
+所以说，因为有了 TLAB 技术，**堆内存并不是完完全全的线程共享，其 eden 区域中还是有一部分空间是分配给线程独享的。**
+
+##### TLAB 生命周期
+
+在 TLAB 已经满了或者接近于满了的时候，TLAB 可能会被释放回 Eden。GC 扫描对象发生时，TLAB 会被释放回 Eden。TLAB 的生命周期期望只存在于一个 GC 扫描周期内。在 JVM 中，一个 GC 扫描周期，就是一个epoch。那么，可以知道，TLAB 内分配内存一定是线性分配的。
+
+##### TLAB 的 dummy 填充
+
+由于 TLAB 仅线程内知道哪些被分配了，在 GC 扫描发生时返回 Eden 区，如果不填充的话，外部并不知道哪一部分被使用哪一部分没有，需要做额外的检查，如果填充已经确认会被回收的对象，也就是 dummy object， GC 会直接标记之后跳过这块内存，提高扫描效率。反正这块内存已经属于 TLAB，其他线程在下次扫描结束前是无法使用的。这个 dummy object 就是 int 数组。
+
+##### TLAB 的两种策略
+
+当需要分配的内存对象大于 tlab 的剩余空间时，有两种策略
+
+> 1. 将本块 TLAB 放回 Eden，申请块新的来用  ( refill 方案)
+>
+> 2. 将本次需要分配的对象直接放在 Eden，下次继续用本块 tlab
+
+那么使用哪种策略呢？显然理想回答是：哪个方案能使 TLAB 浪费的空间尽可能小就选哪种。
+
+> 故可设定一个阈值：TLAB 浪费空间 > 阈值，则浪费太多了，继续用，本次申请对象直接放在 Eden 区。否则采取方案一。
+
+#### 🗑✨CollectedHeap
+
+每个垃圾回收器都会抽象出自己的堆结构，包含最重要的对象分配和垃圾回收接口。**CollectedHeap** 表示可用于垃圾回收的 Java 堆，是一个抽象类，是垃圾回收器的**共同基类**，部分声明代码如下：
+
+```c++
+class CollectedHeap : public CHeapObj<mtGC> {
+  friend class VMStructs;
+  friend class JVMCIVMStructs;
+  friend class IsGCActiveMark; // Block structured external access to _is_gc_active
+  friend class DisableIsGCActiveMark; // Disable current IsGCActiveMark
+  friend class MemAllocator;
+  friend class ParallelObjectIterator;
+  
+ protected:
+    // Create a new tlab. All TLAB allocations must go through this.
+  // To allow more flexible TLAB allocations min_size specifies
+  // the minimum size needed, while requested_size is the requested
+  // size based on ergonomics. The actually allocated size will be
+  // returned in actual_size.
+  virtual HeapWord* allocate_new_tlab(size_t min_size,
+                                      size_t requested_size,
+                                      size_t* actual_size) = 0;
+
+  // Reinitialize tlabs before resuming mutators.
+  virtual void resize_all_tlabs();
+
+  // Raw memory allocation facilities
+  // The obj and array allocate methods are covers for these methods.
+  // mem_allocate() should never be
+  // called to allocate TLABs, only individual objects.
+  virtual HeapWord* mem_allocate(size_t size,
+                                 bool* gc_overhead_limit_was_exceeded) = 0;
+    
+  virtual void trace_heap(GCWhen::Type when, const GCTracer* tracer);
+    
+ public:
+  // 目前支持的 GC 算法类型
+  enum Name {
+    None,
+    Serial,
+    Parallel,
+    G1,
+    Epsilon,
+    Z,
+    Shenandoah
+  };
+
+ protected:
+  // Get a pointer to the derived heap object.  Used to implement
+  // derived class heap() functions rather than being called directly.
+  template<typename T>
+  static T* named_heap(Name kind) {
+    CollectedHeap* heap = Universe::heap();
+    assert(heap != nullptr, "Uninitialized heap");
+    assert(kind == heap->kind(), "Heap kind %u should be %u",
+           static_cast<uint>(heap->kind()), static_cast<uint>(kind));
+    return static_cast<T*>(heap);
+  }
+  // ...
+    
+  // Perform a collection of the heap; intended for use in implementing
+  // "System.gc".  This probably implies as full a collection as the
+  // "CollectedHeap" supports.
+  virtual void collect(GCCause::Cause cause) = 0;
+
+  // Perform a full collection
+  virtual void do_full_collection(bool clear_all_soft_refs) = 0;
+
+   // ...
+}
+```
+
+#### 🗑EpsilonHeap
+
+```c++
+class EpsilonHeap : public CollectedHeap {
+  friend class VMStructs;
+private:
+  EpsilonMonitoringSupport* _monitoring_support;
+  MemoryPool* _pool;
+  GCMemoryManager _memory_manager;
+  ContiguousSpace* _space;
+  VirtualSpace _virtual_space;
+  size_t _max_tlab_size;
+  size_t _step_counter_update;
+  size_t _step_heap_print;
+  int64_t _decay_time_ns;
+  volatile size_t _last_counter_update;
+  volatile size_t _last_heap_print;
+    
+public:
+  static EpsilonHeap* heap();
+
+  EpsilonHeap() :
+          _memory_manager("Epsilon Heap"),
+          _space(nullptr) {};
+
+  Name kind() const override {
+    return CollectedHeap::Epsilon;
+  }
+
+  const char* name() const override {
+    return "Epsilon";
+  }
+
+  jint initialize() override;
+  void initialize_serviceability() override;
+
+  GrowableArray<GCMemoryManager*> memory_managers() override;
+  GrowableArray<MemoryPool*> memory_pools() override;
+
+  size_t max_capacity() const override { return _virtual_space.reserved_size();  }
+  size_t capacity()     const override { return _virtual_space.committed_size(); }
+  size_t used()         const override { return _space->used(); }
+
+  bool is_in(const void* p) const override {
+    return _space->is_in(p);
+  }
+
+  bool requires_barriers(stackChunkOop obj) const override { return false; }
+
+  bool is_maximal_no_gc() const override {
+    // No GC is going to happen. Return "we are at max", when we are about to fail.
+    return used() == capacity();
+  }
+    
+  // ...
+}
+```
+
+##### 🍸内存分配
+
+###### 1️⃣tlab 分配机制
+
+先尝试 tlab 分配
+
+```c++
+HeapWord* EpsilonHeap::allocate_new_tlab(size_t min_size,
+                                         size_t requested_size,
+                                         size_t* actual_size) {
+  Thread* thread = Thread::current();
+
+  // Defaults in case elastic paths are not taken
+  bool fits = true;
+  size_t size = requested_size;
+  size_t ergo_tlab = requested_size;
+  int64_t time = 0;
+
+  if (EpsilonElasticTLAB) {
+    ergo_tlab = EpsilonThreadLocalData::ergo_tlab_size(thread);
+
+    if (EpsilonElasticTLABDecay) {
+      int64_t last_time = EpsilonThreadLocalData::last_tlab_time(thread);
+      time = (int64_t) os::javaTimeNanos();
+
+      assert(last_time <= time, "time should be monotonic");
+
+      // If the thread had not allocated recently, retract the ergonomic size.
+      // This conserves memory when the thread had initial burst of allocations,
+      // and then started allocating only sporadically.
+      if (last_time != 0 && (time - last_time > _decay_time_ns)) {
+        ergo_tlab = 0;
+        EpsilonThreadLocalData::set_ergo_tlab_size(thread, 0);
+      }
+    }
+
+    // If we can fit the allocation under current TLAB size, do so.
+    // Otherwise, we want to elastically increase the TLAB size.
+    fits = (requested_size <= ergo_tlab);
+    if (!fits) {
+      size = (size_t) (ergo_tlab * EpsilonTLABElasticity);
+    }
+  }
+
+  // Always honor boundaries
+  size = clamp(size, min_size, _max_tlab_size);
+
+  // Always honor alignment
+  size = align_up(size, MinObjAlignment);
+
+  // Check that adjustments did not break local and global invariants
+  assert(is_object_aligned(size),
+         "Size honors object alignment: " SIZE_FORMAT, size);
+  assert(min_size <= size,
+         "Size honors min size: "  SIZE_FORMAT " <= " SIZE_FORMAT, min_size, size);
+  assert(size <= _max_tlab_size,
+         "Size honors max size: "  SIZE_FORMAT " <= " SIZE_FORMAT, size, _max_tlab_size);
+  assert(size <= CollectedHeap::max_tlab_size(),
+         "Size honors global max size: "  SIZE_FORMAT " <= " SIZE_FORMAT, size, CollectedHeap::max_tlab_size());
+
+  if (log_is_enabled(Trace, gc)) {
+    ResourceMark rm;
+    log_trace(gc)("TLAB size for \"%s\" (Requested: " SIZE_FORMAT "K, Min: " SIZE_FORMAT
+                          "K, Max: " SIZE_FORMAT "K, Ergo: " SIZE_FORMAT "K) -> " SIZE_FORMAT "K",
+                  thread->name(),
+                  requested_size * HeapWordSize / K,
+                  min_size * HeapWordSize / K,
+                  _max_tlab_size * HeapWordSize / K,
+                  ergo_tlab * HeapWordSize / K,
+                  size * HeapWordSize / K);
+  }
+
+  // All prepared, let's do it!
+  HeapWord* res = allocate_work(size);
+
+  if (res != nullptr) {
+    // Allocation successful
+    *actual_size = size;
+    if (EpsilonElasticTLABDecay) {
+      EpsilonThreadLocalData::set_last_tlab_time(thread, time);
+    }
+    if (EpsilonElasticTLAB && !fits) {
+      // If we requested expansion, this is our new ergonomic TLAB size
+      EpsilonThreadLocalData::set_ergo_tlab_size(thread, size);
+    }
+  } else {
+    // Allocation failed, reset ergonomics to try and fit smaller TLABs
+    if (EpsilonElasticTLAB) {
+      EpsilonThreadLocalData::set_ergo_tlab_size(thread, 0);
+    }
+  }
+
+  return res;
+}
+```
+
+从代码可以看出，分配不仅仅是简单的对象内存分配，同时涉及 tlab 的调整 (边界扩展 、边界缩减)。
+
+###### 2️⃣直接使用堆 Eden 区
+
+另一种策略是直接在堆上 Eden 区分配。
+
+```c++
+HeapWord* EpsilonHeap::mem_allocate(size_t size, bool *gc_overhead_limit_was_exceeded) {
+  *gc_overhead_limit_was_exceeded = false;
+  return allocate_work(size);
+}
+```
+
+###### 3️⃣在可用空间上分配内存对象
+
+无论是否使用 tlab 机制，最后的分配核心函数 ( 在可用空间上分配内存对象 )都是如下：
+
+```c++
+HeapWord* EpsilonHeap::allocate_work(size_t size, bool verbose) {
+  assert(is_object_aligned(size), "Allocation size should be aligned: " SIZE_FORMAT, size);
+
+  HeapWord* res = nullptr;
+  while (true) {
+    // Try to allocate, assume space is available
+    res = _space->par_allocate(size);
+    if (res != nullptr) {
+      break;
+    }
+
+    // Allocation failed, attempt expansion, and retry:
+    {
+      MutexLocker ml(Heap_lock);
+
+      // Try to allocate under the lock, assume another thread was able to expand
+      res = _space->par_allocate(size);
+      if (res != nullptr) {
+        break;
+      }
+
+      // Expand and loop back if space is available
+      size_t size_in_bytes = size * HeapWordSize;
+      size_t uncommitted_space = max_capacity() - capacity();
+      size_t unused_space = max_capacity() - used();
+      size_t want_space = MAX2(size_in_bytes, EpsilonMinHeapExpand);
+      assert(unused_space >= uncommitted_space,
+             "Unused (" SIZE_FORMAT ") >= uncommitted (" SIZE_FORMAT ")",
+             unused_space, uncommitted_space);
+
+      if (want_space < uncommitted_space) {
+        // Enough space to expand in bulk:
+        bool expand = _virtual_space.expand_by(want_space);
+        assert(expand, "Should be able to expand");
+      } else if (size_in_bytes < unused_space) {
+        // No space to expand in bulk, and this allocation is still possible,
+        // take all the remaining space:
+        bool expand = _virtual_space.expand_by(uncommitted_space);
+        assert(expand, "Should be able to expand");
+      } else {
+        // No space left:
+        return nullptr;
+      }
+
+      _space->set_end((HeapWord *) _virtual_space.high());
+    }
+  }
+
+  size_t used = _space->used();
+
+  // Allocation successful, update counters
+  if (verbose) {
+    size_t last = _last_counter_update;
+    if ((used - last >= _step_counter_update) && Atomic::cmpxchg(&_last_counter_update, last, used) == last) {
+      _monitoring_support->update_counters();
+    }
+  }
+
+  // ...and print the occupancy line, if needed
+  if (verbose) {
+    size_t last = _last_heap_print;
+    if ((used - last >= _step_heap_print) && Atomic::cmpxchg(&_last_heap_print, last, used) == last) {
+      print_heap_info(used);
+      print_metaspace_info();
+    }
+  }
+
+  assert(is_object_aligned(res), "Object should be aligned: " PTR_FORMAT, p2i(res));
+  return res;
+}
+
+// Lock-free.
+HeapWord* ContiguousSpace::par_allocate(size_t size) {
+  return par_allocate_impl(size);
+}
+
+// This version is lock-free.
+inline HeapWord* ContiguousSpace::par_allocate_impl(size_t size) {
+  do {
+    HeapWord* obj = top();
+    if (pointer_delta(end(), obj) >= size) {
+      HeapWord* new_top = obj + size;
+      HeapWord* result = Atomic::cmpxchg(top_addr(), obj, new_top);
+      // 函数功能是：将 obj 与 top_addr 比较，若相同，将 new_top 写入 top_addr 并返回 old 值；若不同返回 top_addr 的值 (Java CAS——Compare and swap 机制也依赖此实现)
+      // result can be one of two:
+      //  the old top value: the exchange succeeded
+      //  otherwise: the new value of the top is returned.
+      if (result == obj) {
+        assert(is_object_aligned(obj) && is_object_aligned(new_top), "checking alignment");
+        return obj;
+      }
+    } else {
+      return nullptr;
+    }
+  } while (true);
+}
+```
+
+其中 HeapWordImpl 可理解为一个堆指针：
+
+```c++
+// An opaque type, so that HeapWord* can be a generic pointer into the heap.
+// We require that object sizes be measured in units of heap words (e.g.
+// pointer-sized values), so that given HeapWord* hw,
+//   hw += oop(hw)->foo();
+// works, where foo is a method (like size or scavenge) that returns the
+// object size.
+class HeapWordImpl;             // Opaque, never defined.
+typedef HeapWordImpl* HeapWord;
+```
+
+###### 关于 CAS ( Compare and swap )
+
+其中 *Atomic::cmpxchg* 是 Java CAS 机制的重要支撑，其通过汇编实现：
+
+```c++
+template<typename D, typename U, typename T>
+inline D Atomic::cmpxchg(D volatile* dest,
+                         U compare_value,
+                         T exchange_value,
+                         atomic_memory_order order) {
+  return CmpxchgImpl<D, U, T>()(dest, compare_value, exchange_value, order);
+}
+```
+
+以下是 x86 下 Linux 的代码核心实现
+
+```c++
+template<>
+template<typename T>
+inline T Atomic::PlatformCmpxchg<4>::operator()(T volatile* dest,
+                                                T compare_value,
+                                                T exchange_value,
+                                                atomic_memory_order /* order */) const {
+  STATIC_ASSERT(4 == sizeof(T));
+  __asm__ volatile ("lock cmpxchgl %1,(%3)"
+                    : "=a" (exchange_value)
+                    : "r" (exchange_value), "a" (compare_value), "r" (dest)
+                    : "cc", "memory");
+  return exchange_value;
+}
+```
+
+> 汇编指令的解释如下：
+>
+> 1. 前三行分别表示：**汇编指令**、**输出列表**、**输入列表**
+> 2. 输出列表表示指令结束后 EAX 的值 通过 exchange_value 返回。
+> 3. "**r**" 表示寄存器，代表随机一个可用寄存器来存储值，"**a**" 表示 EAX 寄存器。
+> 4. 汇编指令的 **%n** 表示输入列表中的第 n 个操作数 (从 **1** 开始)。
+
+从申请过程可以看出，如果申请失败，将尝试扩容再申请 ( 扩容过程将给堆加锁，这个过程要考虑同步问题，即获得锁后要再次验证其他线程是否已经完成扩容 )，扩容分为两种情况：
+
+> 1. 分配想要的大小。
+> 2. 想要的大小大于剩余可用空间，将剩余的所有可用空间进行分配。
+
+扩容成功则设置 堆 的 **end** 指针。
+
+申请成功后将按需进行日志输出。
+
+##### 🍸垃圾回收
+
+```c++
+void EpsilonHeap::collect(GCCause::Cause cause) {
+  switch (cause) {
+    case GCCause::_metadata_GC_threshold:
+    case GCCause::_metadata_GC_clear_soft_refs:
+      // Receiving these causes means the VM itself entered the safepoint for metadata collection.
+      // While Epsilon does not do GC, it has to perform sizing adjustments, otherwise we would
+      // re-enter the safepoint again very soon.
+
+      assert(SafepointSynchronize::is_at_safepoint(), "Expected at safepoint");
+      log_info(gc)("GC request for \"%s\" is handled", GCCause::to_string(cause));
+      MetaspaceGC::compute_new_size();
+      print_metaspace_info();
+      break;
+    default:
+      log_info(gc)("GC request for \"%s\" is ignored", GCCause::to_string(cause));
+  }
+  _monitoring_support->update_counters();
+}
+
+void EpsilonHeap::do_full_collection(bool clear_all_soft_refs) {
+  collect(gc_cause());
+}
+```
+
+从源码中可以看出，该算法**并不回收垃圾**，仅是简单地记录日志信息与计算新的 gc 水准线。
+
+#### 🗑G1CollectedHeap
+
+#### 🗑SerialHeap
+
+#### 🗑ParallelScavengeHeap
+
+#### 🗑ShenandoahHeap
+
+#### 🗑ZCollectedHeap
 
 ## 🖊类加载器
 
