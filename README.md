@@ -4218,6 +4218,16 @@ class CollectedHeap : public CHeapObj<mtGC> {
   // Perform a full collection
   virtual void do_full_collection(bool clear_all_soft_refs) = 0;
 
+  // Workers used in non-GC safepoints for parallel safepoint cleanup. If this
+  // method returns null, cleanup tasks are done serially in the VMThread. See
+  // `SafepointSynchronize::do_cleanup_tasks` for details.
+  // GCs using a GC worker thread pool inside GC safepoints may opt to share
+  // that pool with non-GC safepoints, avoiding creating extraneous threads.
+  // Such sharing is safe, because GC safepoints and non-GC safepoints never
+  // overlap. For example, `G1CollectedHeap::workers()` (for GC safepoints) and
+  // `G1CollectedHeap::safepoint_workers()` (for non-GC safepoints) return the
+  // same thread-pool.
+  virtual WorkerThreads* safepoint_workers() { return nullptr; }
    // ...
 }
 ```
@@ -4282,7 +4292,7 @@ public:
 
 ##### 🍸内存分配
 
-###### 1️⃣tlab 分配机制
+###### 1️⃣tlab 慢分配
 
 先尝试 tlab 分配
 
@@ -4582,11 +4592,1342 @@ void EpsilonHeap::do_full_collection(bool clear_all_soft_refs) {
 
 从源码中可以看出，该算法**并不回收垃圾**，仅是简单地记录日志信息与计算新的 gc 水准线。
 
-#### 🗑G1CollectedHeap
-
 #### 🗑SerialHeap
 
+##### 🍸分代类型
+
+```c++
+class SerialHeap : public CollectedHeap {
+  friend class Generation;
+  friend class DefNewGeneration;
+  friend class TenuredGeneration;
+  friend class GenMarkSweep;
+  friend class VM_GenCollectForAllocation;
+  friend class VM_GenCollectFull;
+  friend class VM_GC_HeapInspection;
+  friend class VM_HeapDumper;
+  friend class HeapInspection;
+  friend class GCCauseSetter;
+  friend class VMStructs;
+public:
+  friend class VM_PopulateDumpSharedSpace;
+
+  enum GenerationType {
+    YoungGen,
+    OldGen
+  };
+
+private:
+  DefNewGeneration* _young_gen;
+  TenuredGeneration* _old_gen;
+  // ...
+}
+```
+
+```c++
+// DefNewGeneration is a young generation containing eden, from- and
+// to-space.
+
+class DefNewGeneration: public Generation {
+  friend class VMStructs;
+  // ...
+}
+```
+
+```c++
+// TenuredGeneration models the heap containing old (promoted/tenured) objects
+// contained in a single contiguous space. This generation is covered by a card
+// table, and uses a card-size block-offset array to implement block_start.
+// Garbage collection is performed using mark-compact.
+
+class TenuredGeneration: public Generation {
+  friend class VMStructs;
+  // Abstractly, this is a subtype that gets access to protected fields.
+  friend class VM_PopulateDumpSharedSpace;
+
+  MemRegion _prev_used_region;
+  // ...
+}
+```
+
+从源码可以看出，支持年轻代与老年代。
+
+##### 🍸内存分配
+
+###### TLAB 慢分配
+
+尝试在 Young 区分配 tlab
+
+```c++
+HeapWord* SerialHeap::allocate_new_tlab(size_t min_size,
+                                        size_t requested_size,
+                                        size_t* actual_size) {
+  HeapWord* result = mem_allocate_work(requested_size /* size */,
+                                       true /* is_tlab */);
+  if (result != nullptr) {
+    *actual_size = requested_size;
+  }
+
+  return result;
+}
+```
+
+```c++
+HeapWord* SerialHeap::mem_allocate_work(size_t size,
+                                        bool is_tlab) {
+
+  HeapWord* result = nullptr;
+
+  // Loop until the allocation is satisfied, or unsatisfied after GC.
+  for (uint try_count = 1, gclocker_stalled_count = 0; /* return or throw */; try_count += 1) {
+
+    // First allocation attempt is lock-free.
+    Generation *young = _young_gen;
+    if (young->should_allocate(size, is_tlab)) {
+      result = young->par_allocate(size, is_tlab);
+      if (result != nullptr) {
+        assert(is_in_reserved(result), "result not in heap");
+        return result;
+      }
+    }
+    uint gc_count_before;  // Read inside the Heap_lock locked region.
+    {
+      MutexLocker ml(Heap_lock);
+      log_trace(gc, alloc)("SerialHeap::mem_allocate_work: attempting locked slow path allocation");
+      // Note that only large objects get a shot at being
+      // allocated in later generations.
+      // 大对象有机会在 年老代 分配
+      bool first_only = !should_try_older_generation_allocation(size);
+
+      result = attempt_allocation(size, is_tlab, first_only);
+      if (result != nullptr) {
+        assert(is_in_reserved(result), "result not in heap");
+        return result;
+      }
+
+      if (GCLocker::is_active_and_needs_gc()) {
+        if (is_tlab) {
+          return nullptr;  // Caller will retry allocating individual object.
+        }
+        if (!is_maximal_no_gc()) {
+          // Try and expand heap to satisfy request.
+          result = expand_heap_and_allocate(size, is_tlab);
+          // Result could be null if we are out of space.
+          if (result != nullptr) {
+            return result;
+          }
+        }
+
+        if (gclocker_stalled_count > GCLockerRetryAllocationCount) {
+          return nullptr; // We didn't get to do a GC and we didn't get any memory.
+        }
+
+        // If this thread is not in a jni critical section, we stall
+        // the requestor until the critical section has cleared and
+        // GC allowed. When the critical section clears, a GC is
+        // initiated by the last thread exiting the critical section; so
+        // we retry the allocation sequence from the beginning of the loop,
+        // rather than causing more, now probably unnecessary, GC attempts.
+        JavaThread* jthr = JavaThread::current();
+        if (!jthr->in_critical()) {
+          MutexUnlocker mul(Heap_lock);
+          // Wait for JNI critical section to be exited
+          GCLocker::stall_until_clear();
+          gclocker_stalled_count += 1;
+          continue;
+        } else {
+          if (CheckJNICalls) {
+            fatal("Possible deadlock due to allocating while"
+                  " in jni critical section");
+          }
+          return nullptr;
+        }
+      }
+
+      // Read the gc count while the heap lock is held.
+      gc_count_before = total_collections();
+    }
+
+    VM_GenCollectForAllocation op(size, is_tlab, gc_count_before);
+    VMThread::execute(&op);
+    if (op.prologue_succeeded()) {
+      result = op.result();
+      if (op.gc_locked()) {
+         assert(result == nullptr, "must be null if gc_locked() is true");
+         continue;  // Retry and/or stall as necessary.
+      }
+
+      assert(result == nullptr || is_in_reserved(result),
+             "result not in heap");
+      return result;
+    }
+
+    // Give a warning if we seem to be looping forever.
+    if ((QueuedAllocationWarningCount > 0) &&
+        (try_count % QueuedAllocationWarningCount == 0)) {
+          log_warning(gc, ergo)("SerialHeap::mem_allocate_work retries %d times,"
+                                " size=" SIZE_FORMAT " %s", try_count, size, is_tlab ? "(TLAB)" : "");
+    }
+  }
+}
+```
+
+在分配过程中会判断是否应该在 Old 区进行分配
+
+```c++
+// Return true if any of the following is true:
+// . the allocation won't fit into the current young gen heap
+// . gc locker is occupied (jni critical section)
+// . heap memory is tight -- the most recent previous collection
+//   was a full collection because a partial collection (would
+//   have) failed and is likely to fail again
+bool SerialHeap::should_try_older_generation_allocation(size_t word_size) const {
+  size_t young_capacity = _young_gen->capacity_before_gc();
+  return    (word_size > heap_word_size(young_capacity))
+         || GCLocker::is_active_and_needs_gc()
+         || incremental_collection_failed();
+}
+```
+
+```c++
+HeapWord* SerialHeap::attempt_allocation(size_t size,
+                                         bool is_tlab,
+                                         bool first_only) {
+  // first_only 表明是否只在 年轻代 分配
+  HeapWord* res = nullptr;
+
+  if (_young_gen->should_allocate(size, is_tlab)) {
+    res = _young_gen->allocate(size, is_tlab);
+    if (res != nullptr || first_only) {
+      return res;
+    }
+  }
+
+  if (_old_gen->should_allocate(size, is_tlab)) {
+    res = _old_gen->allocate(size, is_tlab);
+  }
+
+  return res;
+}
+```
+
+###### 直接在 Young 区分配
+
+```c++
+HeapWord* SerialHeap::mem_allocate(size_t size,
+                                   bool* gc_overhead_limit_was_exceeded) {
+  return mem_allocate_work(size,
+                           false /* is_tlab */);
+}
+```
+
+##### ✨Stop the World
+
+```c++
+class SafepointSynchronize : AllStatic {
+ public:
+  enum SynchronizeState {
+      _not_synchronized = 0,                   // Threads not synchronized at a safepoint. Keep this value 0.
+      _synchronizing    = 1,                   // Synchronizing in progress
+      _synchronized     = 2                    // All Java threads are running in native, blocked in OS or stopped at safepoint.
+                                               // VM thread and any NonJavaThread may be running.
+  };
+   // ...
+}
+```
+
+```c++
+// Roll all threads forward to a safepoint and suspend them all
+void SafepointSynchronize::begin() {
+  assert(Thread::current()->is_VM_thread(), "Only VM thread may execute a safepoint");
+
+  EventSafepointBegin begin_event;
+  SafepointTracing::begin(VMThread::vm_op_type());
+
+  Universe::heap()->safepoint_synchronize_begin();
+
+  // By getting the Threads_lock, we assure that no threads are about to start or
+  // exit. It is released again in SafepointSynchronize::end().
+  Threads_lock->lock();
+
+  assert( _state == _not_synchronized, "trying to safepoint synchronize with wrong state");
+
+  int nof_threads = Threads::number_of_threads();
+
+  _nof_threads_hit_polling_page = 0;
+
+  log_debug(safepoint)("Safepoint synchronization initiated using %s wait barrier. (%d threads)", _wait_barrier->description(), nof_threads);
+
+  // Reset the count of active JNI critical threads
+  _current_jni_active_count = 0;
+
+  // Set number of threads to wait for
+  _waiting_to_block = nof_threads;
+
+  jlong safepoint_limit_time = 0;
+  if (SafepointTimeout) {
+    // Set the limit time, so that it can be compared to see if this has taken
+    // too long to complete.
+    safepoint_limit_time = SafepointTracing::start_of_safepoint() + (jlong)(SafepointTimeoutDelay * NANOSECS_PER_MILLISEC);
+    timeout_error_printed = false;
+  }
+
+  EventSafepointStateSynchronization sync_event;
+  int initial_running = 0;
+
+  // Arms the safepoint, _current_jni_active_count and _waiting_to_block must be set before.
+  arm_safepoint();
+
+  // Will spin until all threads are safe.
+  int iterations = synchronize_threads(safepoint_limit_time, nof_threads, &initial_running);
+  assert(_waiting_to_block == 0, "No thread should be running");
+
+#ifndef PRODUCT
+  // Mark all threads
+  if (VerifyCrossModifyFence) {
+    JavaThreadIteratorWithHandle jtiwh;
+    for (; JavaThread *cur = jtiwh.next(); ) {
+      cur->set_requires_cross_modify_fence(true);
+    }
+  }
+
+  if (safepoint_limit_time != 0) {
+    jlong current_time = os::javaTimeNanos();
+    if (safepoint_limit_time < current_time) {
+      log_warning(safepoint)("# SafepointSynchronize: Finished after "
+                    INT64_FORMAT_W(6) " ms",
+                    (int64_t)(current_time - SafepointTracing::start_of_safepoint()) / (NANOUNITS / MILLIUNITS));
+    }
+  }
+#endif
+
+  assert(Threads_lock->owned_by_self(), "must hold Threads_lock");
+
+  // Record state
+  _state = _synchronized;
+
+  OrderAccess::fence();
+
+  // Set the new id
+  ++_safepoint_id;
+
+#ifdef ASSERT
+  // Make sure all the threads were visited.
+  for (JavaThreadIteratorWithHandle jtiwh; JavaThread *cur = jtiwh.next(); ) {
+    assert(cur->was_visited_for_critical_count(_safepoint_counter), "missed a thread");
+  }
+#endif // ASSERT
+
+  // Update the count of active JNI critical regions
+  GCLocker::set_jni_lock_count(_current_jni_active_count);
+
+  post_safepoint_synchronize_event(sync_event,
+                                   _safepoint_id,
+                                   initial_running,
+                                   _waiting_to_block, iterations);
+
+  SafepointTracing::synchronized(nof_threads, initial_running, _nof_threads_hit_polling_page);
+
+  // We do the safepoint cleanup first since a GC related safepoint
+  // needs cleanup to be completed before running the GC op.
+  EventSafepointCleanup cleanup_event;
+  do_cleanup_tasks();
+  post_safepoint_cleanup_event(cleanup_event, _safepoint_id);
+
+  post_safepoint_begin_event(begin_event, _safepoint_id, nof_threads, _current_jni_active_count);
+  SafepointTracing::cleanup();
+}
+```
+
+```c++
+// Wake up all threads, so they are ready to resume execution after the safepoint
+// operation has been carried out
+void SafepointSynchronize::end() {
+  assert(Threads_lock->owned_by_self(), "must hold Threads_lock");
+  EventSafepointEnd event;
+  assert(Thread::current()->is_VM_thread(), "Only VM thread can execute a safepoint");
+
+  disarm_safepoint();
+
+  Universe::heap()->safepoint_synchronize_end();
+
+  SafepointTracing::end();
+
+  post_safepoint_end_event(event, safepoint_id());
+}
+
+void SafepointSynchronize::disarm_safepoint() {
+  uint64_t active_safepoint_counter = _safepoint_counter;
+  {
+    JavaThreadIteratorWithHandle jtiwh;
+#ifdef ASSERT
+    // A pending_exception cannot be installed during a safepoint.  The threads
+    // may install an async exception after they come back from a safepoint into
+    // pending_exception after they unblock.  But that should happen later.
+    for (; JavaThread *cur = jtiwh.next(); ) {
+      assert (!(cur->has_pending_exception() &&
+                cur->safepoint_state()->is_at_poll_safepoint()),
+              "safepoint installed a pending exception");
+    }
+#endif // ASSERT
+
+    OrderAccess::fence(); // keep read and write of _state from floating up
+    assert(_state == _synchronized, "must be synchronized before ending safepoint synchronization");
+
+    // Change state first to _not_synchronized.
+    // No threads should see _synchronized when running.
+    _state = _not_synchronized;
+
+    // Set the next dormant (even) safepoint id.
+    assert((_safepoint_counter & 0x1) == 1, "must be odd");
+    Atomic::release_store(&_safepoint_counter, _safepoint_counter + 1);
+
+    OrderAccess::fence(); // Keep the local state from floating up.
+
+    jtiwh.rewind();
+    for (; JavaThread *current = jtiwh.next(); ) {
+      // Clear the visited flag to ensure that the critical counts are collected properly.
+      DEBUG_ONLY(current->reset_visited_for_critical_count(active_safepoint_counter);)
+      ThreadSafepointState* cur_state = current->safepoint_state();
+      assert(!cur_state->is_running(), "Thread not suspended at safepoint");
+      cur_state->restart(); // TSS _running
+      assert(cur_state->is_running(), "safepoint state has not been reset");
+    }
+  } // ~JavaThreadIteratorWithHandle
+
+  // Release threads lock, so threads can be created/destroyed again.
+  Threads_lock->unlock();
+
+  // Wake threads after local state is correctly set.
+  _wait_barrier->disarm();
+}
+```
+
+
+
+##### 🍸垃圾回收
+
+```c++
+// public collection interfaces
+void SerialHeap::collect(GCCause::Cause cause) {
+  // The caller doesn't have the Heap_lock
+  assert(!Heap_lock->owned_by_self(), "this thread should not own the Heap_lock");
+
+  unsigned int gc_count_before;
+  unsigned int full_gc_count_before;
+
+  {
+    MutexLocker ml(Heap_lock);
+    // Read the GC count while holding the Heap_lock
+    gc_count_before      = total_collections();
+    full_gc_count_before = total_full_collections();
+  }
+
+  if (GCLocker::should_discard(cause, gc_count_before)) {
+    return;
+  }
+
+  bool should_run_young_gc =  (cause == GCCause::_wb_young_gc)
+                           || (cause == GCCause::_gc_locker)
+                DEBUG_ONLY(|| (cause == GCCause::_scavenge_alot));
+
+  const GenerationType max_generation = should_run_young_gc
+                                      ? YoungGen
+                                      : OldGen;
+
+  while (true) {
+    VM_GenCollectFull op(gc_count_before, full_gc_count_before,
+                         cause, max_generation);
+    VMThread::execute(&op);
+
+    if (!GCCause::is_explicit_full_gc(cause)) {
+      return;
+    }
+
+    {
+      MutexLocker ml(Heap_lock);
+      // Read the GC count while holding the Heap_lock
+      if (full_gc_count_before != total_full_collections()) {
+        return;
+      }
+    }
+
+    if (GCLocker::is_active_and_needs_gc()) {
+      // If GCLocker is active, wait until clear before retrying.
+      GCLocker::stall_until_clear();
+    }
+  }
+}
+```
+
+
+
+```c++
+void SerialHeap::do_full_collection(bool clear_all_soft_refs) {
+   do_full_collection(clear_all_soft_refs, OldGen);
+}
+
+void SerialHeap::do_full_collection(bool clear_all_soft_refs,
+                                    GenerationType last_generation) {
+  do_collection(true,                   // full
+                clear_all_soft_refs,    // clear_all_soft_refs
+                0,                      // size
+                false,                  // is_tlab
+                last_generation);       // last_generation
+  // Hack XXX FIX ME !!!
+  // A scavenge may not have been attempted, or may have
+  // been attempted and failed, because the old gen was too full
+  if (gc_cause() == GCCause::_gc_locker && incremental_collection_failed()) {
+    log_debug(gc, jni)("GC locker: Trying a full collection because scavenge failed");
+    // This time allow the old gen to be collected as well
+    do_collection(true,                // full
+                  clear_all_soft_refs, // clear_all_soft_refs
+                  0,                   // size
+                  false,               // is_tlab
+                  OldGen);             // last_generation
+  }
+}
+```
+
+```c++
+void SerialHeap::do_collection(bool full,
+                               bool clear_all_soft_refs,
+                               size_t size,
+                               bool is_tlab,
+                               GenerationType max_generation) {
+  ResourceMark rm;
+  DEBUG_ONLY(Thread* my_thread = Thread::current();)
+
+  assert(SafepointSynchronize::is_at_safepoint(), "should be at safepoint");
+  assert(my_thread->is_VM_thread(), "only VM thread");
+  assert(Heap_lock->is_locked(),
+         "the requesting thread should have the Heap_lock");
+  guarantee(!is_gc_active(), "collection is not reentrant");
+
+  if (GCLocker::check_active_before_gc()) {
+    return; // GC is disabled (e.g. JNI GetXXXCritical operation)
+  }
+
+  const bool do_clear_all_soft_refs = clear_all_soft_refs ||
+                          soft_ref_policy()->should_clear_all_soft_refs();
+
+  ClearedAllSoftRefs casr(do_clear_all_soft_refs, soft_ref_policy());
+
+  AutoModifyRestore<bool> temporarily(_is_gc_active, true);
+
+  bool complete = full && (max_generation == OldGen);
+  bool old_collects_young = complete && !ScavengeBeforeFullGC;
+  bool do_young_collection = !old_collects_young && _young_gen->should_collect(full, size, is_tlab);
+
+  const PreGenGCValues pre_gc_values = get_pre_gc_values();
+
+  bool run_verification = total_collections() >= VerifyGCStartAt;
+  bool prepared_for_verification = false;
+  bool do_full_collection = false;
+
+  if (do_young_collection) {
+    GCIdMark gc_id_mark;
+    GCTraceCPUTime tcpu(((DefNewGeneration*)_young_gen)->gc_tracer());
+    GCTraceTime(Info, gc) t("Pause Young", nullptr, gc_cause(), true);
+
+    print_heap_before_gc();
+
+    if (run_verification && VerifyBeforeGC) {
+      prepare_for_verify();
+      prepared_for_verification = true;
+    }
+
+    gc_prologue(complete);
+    increment_total_collections(complete);
+
+    collect_generation(_young_gen,
+                       full,
+                       size,
+                       is_tlab,
+                       run_verification,
+                       do_clear_all_soft_refs);
+
+    if (size > 0 && (!is_tlab || _young_gen->supports_tlab_allocation()) &&
+        size * HeapWordSize <= _young_gen->unsafe_max_alloc_nogc()) {
+      // Allocation request was met by young GC.
+      size = 0;
+    }
+
+    // Ask if young collection is enough. If so, do the final steps for young collection,
+    // and fallthrough to the end.
+    do_full_collection = should_do_full_collection(size, full, is_tlab, max_generation);
+    if (!do_full_collection) {
+      // Adjust generation sizes.
+      _young_gen->compute_new_size();
+
+      print_heap_change(pre_gc_values);
+
+      // Track memory usage and detect low memory after GC finishes
+      MemoryService::track_memory_usage();
+
+      gc_epilogue(complete);
+    }
+
+    print_heap_after_gc();
+
+  } else {
+    // No young collection, ask if we need to perform Full collection.
+    do_full_collection = should_do_full_collection(size, full, is_tlab, max_generation);
+  }
+
+  if (do_full_collection) {
+    GCIdMark gc_id_mark;
+    GCTraceCPUTime tcpu(GenMarkSweep::gc_tracer());
+    GCTraceTime(Info, gc) t("Pause Full", nullptr, gc_cause(), true);
+
+    print_heap_before_gc();
+
+    if (!prepared_for_verification && run_verification && VerifyBeforeGC) {
+      prepare_for_verify();
+    }
+
+    if (!do_young_collection) {
+      gc_prologue(complete);
+      increment_total_collections(complete);
+    }
+
+    // Accounting quirk: total full collections would be incremented when "complete"
+    // is set, by calling increment_total_collections above. However, we also need to
+    // account Full collections that had "complete" unset.
+    if (!complete) {
+      increment_total_full_collections();
+    }
+
+    CodeCache::on_gc_marking_cycle_start();
+
+    ClassUnloadingContext ctx(1 /* num_nmethod_unlink_workers */,
+                              false /* unregister_nmethods_during_purge */,
+                              false /* lock_codeblob_free_separately */);
+
+    collect_generation(_old_gen,
+                       full,
+                       size,
+                       is_tlab,
+                       run_verification,
+                       do_clear_all_soft_refs);
+
+    CodeCache::on_gc_marking_cycle_finish();
+    CodeCache::arm_all_nmethods();
+
+    // Adjust generation sizes.
+    _old_gen->compute_new_size();
+    _young_gen->compute_new_size();
+
+    // Delete metaspaces for unloaded class loaders and clean up loader_data graph
+    ClassLoaderDataGraph::purge(/*at_safepoint*/true);
+    DEBUG_ONLY(MetaspaceUtils::verify();)
+
+    // Need to clear claim bits for the next mark.
+    ClassLoaderDataGraph::clear_claimed_marks();
+
+    // Resize the metaspace capacity after full collections
+    MetaspaceGC::compute_new_size();
+
+    print_heap_change(pre_gc_values);
+
+    // Track memory usage and detect low memory after GC finishes
+    MemoryService::track_memory_usage();
+
+    // Need to tell the epilogue code we are done with Full GC, regardless what was
+    // the initial value for "complete" flag.
+    gc_epilogue(true);
+
+    print_heap_after_gc();
+  }
+}
+```
+
+###### ↔分代回收
+
+```c++
+void SerialHeap::collect_generation(Generation* gen, bool full, size_t size,
+                                    bool is_tlab, bool run_verification, bool clear_soft_refs) {
+  FormatBuffer<> title("Collect gen: %s", gen->short_name());
+  GCTraceTime(Trace, gc, phases) t1(title);
+  TraceCollectorStats tcs(gen->counters());
+  TraceMemoryManagerStats tmms(gen->gc_manager(), gc_cause(), heap()->is_young_gen(gen) ? "end of minor GC" : "end of major GC");
+
+  gen->stat_record()->invocations++;
+  gen->stat_record()->accumulated_time.start();
+
+  // Must be done anew before each collection because
+  // a previous collection will do mangling and will
+  // change top of some spaces.
+  record_gen_tops_before_GC();
+
+  log_trace(gc)("%s invoke=%d size=" SIZE_FORMAT, heap()->is_young_gen(gen) ? "Young" : "Old", gen->stat_record()->invocations, size * HeapWordSize);
+
+  if (run_verification && VerifyBeforeGC) {
+    Universe::verify("Before GC");
+  }
+  COMPILER2_OR_JVMCI_PRESENT(DerivedPointerTable::clear());
+
+  // Do collection work
+  {
+    save_marks();   // save marks for all gens
+
+    gen->collect(full, clear_soft_refs, size, is_tlab);
+  }
+
+  COMPILER2_OR_JVMCI_PRESENT(DerivedPointerTable::update_pointers());
+
+  gen->stat_record()->accumulated_time.stop();
+
+  update_gc_stats(gen, full);
+
+  if (run_verification && VerifyAfterGC) {
+    Universe::verify("After GC");
+  }
+}
+```
+
+其中 
+
+> collect 
+
+是一个虚函数，用于每个代实现不同的回收方案。
+
+```c++
+class Generation: public CHeapObj<mtGC> {
+  friend class VMStructs;
+ private:
+  GCMemoryManager* _gc_manager;
+// Perform a garbage collection.
+  // If full is true attempt a full garbage collection of this generation.
+  // Otherwise, attempting to (at least) free enough space to support an
+  // allocation of the given "word_size".
+  virtual void collect(bool   full,
+                       bool   clear_all_soft_refs,
+                       size_t word_size,
+                       bool   is_tlab) = 0;
+  // ...
+}
+```
+
+###### ⤵年轻代
+
+年轻代采用 复制算法
+
+```c++
+void DefNewGeneration::collect(bool   full,
+                               bool   clear_all_soft_refs,
+                               size_t size,
+                               bool   is_tlab) {
+  assert(full || size > 0, "otherwise we don't want to collect");
+
+  SerialHeap* heap = SerialHeap::heap();
+
+  // If the next generation is too full to accommodate promotion
+  // from this generation, pass on collection; let the next generation
+  // do it.
+  if (!collection_attempt_is_safe()) {
+    log_trace(gc)(":: Collection attempt not safe ::");
+    heap->set_incremental_collection_failed(); // Slight lie: we did not even attempt one
+    return;
+  }
+  assert(to()->is_empty(), "Else not collection_attempt_is_safe");
+  _gc_timer->register_gc_start();
+  _gc_tracer->report_gc_start(heap->gc_cause(), _gc_timer->gc_start());
+  _ref_processor->start_discovery(clear_all_soft_refs);
+
+  _old_gen = heap->old_gen();
+
+  init_assuming_no_promotion_failure();
+
+  GCTraceTime(Trace, gc, phases) tm("DefNew", nullptr, heap->gc_cause());
+
+  heap->trace_heap_before_gc(_gc_tracer);
+
+  // These can be shared for all code paths
+  IsAliveClosure is_alive(this);
+
+  age_table()->clear();
+  to()->clear(SpaceDecorator::Mangle);
+  // The preserved marks should be empty at the start of the GC.
+  _preserved_marks_set.init(1);
+
+  assert(heap->no_allocs_since_save_marks(),
+         "save marks have not been newly set.");
+
+  YoungGenScanClosure young_gen_cl(this);
+  OldGenScanClosure   old_gen_cl(this);
+
+  FastEvacuateFollowersClosure evacuate_followers(heap,
+                                                  &young_gen_cl,
+                                                  &old_gen_cl);
+
+  assert(heap->no_allocs_since_save_marks(),
+         "save marks have not been newly set.");
+
+  {
+    StrongRootsScope srs(0);
+    RootScanClosure root_cl{this};
+    CLDScanClosure cld_cl{this};
+
+    MarkingCodeBlobClosure code_cl(&root_cl,
+                                   CodeBlobToOopClosure::FixRelocations,
+                                   false /* keepalive_nmethods */);
+
+    heap->process_roots(SerialHeap::SO_ScavengeCodeCache,
+                        &root_cl,
+                        &cld_cl,
+                        &cld_cl,
+                        &code_cl);
+
+    _old_gen->scan_old_to_young_refs();
+  }
+
+  // "evacuate followers".
+  evacuate_followers.do_void();
+
+  {
+    // Reference processing
+    KeepAliveClosure keep_alive(this);
+    ReferenceProcessor* rp = ref_processor();
+    ReferenceProcessorPhaseTimes pt(_gc_timer, rp->max_num_queues());
+    SerialGCRefProcProxyTask task(is_alive, keep_alive, evacuate_followers);
+    const ReferenceProcessorStats& stats = rp->process_discovered_references(task, pt);
+    _gc_tracer->report_gc_reference_stats(stats);
+    _gc_tracer->report_tenuring_threshold(tenuring_threshold());
+    pt.print_all_references();
+  }
+  assert(heap->no_allocs_since_save_marks(), "save marks have not been newly set.");
+
+  {
+    AdjustWeakRootClosure cl{this};
+    WeakProcessor::weak_oops_do(&is_alive, &cl);
+  }
+
+  // Verify that the usage of keep_alive didn't copy any objects.
+  assert(heap->no_allocs_since_save_marks(), "save marks have not been newly set.");
+
+  _string_dedup_requests.flush();
+
+  if (!_promotion_failed) {
+    // Swap the survivor spaces.
+    eden()->clear(SpaceDecorator::Mangle);
+    from()->clear(SpaceDecorator::Mangle);
+    if (ZapUnusedHeapArea) {
+      // This is now done here because of the piece-meal mangling which
+      // can check for valid mangling at intermediate points in the
+      // collection(s).  When a young collection fails to collect
+      // sufficient space resizing of the young generation can occur
+      // an redistribute the spaces in the young generation.  Mangle
+      // here so that unzapped regions don't get distributed to
+      // other spaces.
+      to()->mangle_unused_area();
+    }
+    swap_spaces();
+
+    assert(to()->is_empty(), "to space should be empty now");
+
+    adjust_desired_tenuring_threshold();
+
+    assert(!heap->incremental_collection_failed(), "Should be clear");
+  } else {
+    assert(_promo_failure_scan_stack.is_empty(), "post condition");
+    _promo_failure_scan_stack.clear(true); // Clear cached segments.
+
+    remove_forwarding_pointers();
+    log_info(gc, promotion)("Promotion failed");
+    // Add to-space to the list of space to compact
+    // when a promotion failure has occurred.  In that
+    // case there can be live objects in to-space
+    // as a result of a partial evacuation of eden
+    // and from-space.
+    swap_spaces();   // For uniformity wrt ParNewGeneration.
+    from()->set_next_compaction_space(to());
+    heap->set_incremental_collection_failed();
+
+    _gc_tracer->report_promotion_failed(_promotion_failed_info);
+
+    // Reset the PromotionFailureALot counters.
+    NOT_PRODUCT(heap->reset_promotion_should_fail();)
+  }
+  // We should have processed and cleared all the preserved marks.
+  _preserved_marks_set.reclaim();
+
+  heap->trace_heap_after_gc(_gc_tracer);
+
+  _gc_timer->register_gc_end();
+
+  _gc_tracer->report_gc_end(_gc_timer->gc_end(), _gc_timer->time_partitions());
+}
+```
+
+###### ⤵老年代
+
+```c++
+void TenuredGeneration::collect(bool   full,
+                                bool   clear_all_soft_refs,
+                                size_t size,
+                                bool   is_tlab) {
+  SerialHeap* gch = SerialHeap::heap();
+
+  STWGCTimer* gc_timer = GenMarkSweep::gc_timer();
+  gc_timer->register_gc_start();
+
+  SerialOldTracer* gc_tracer = GenMarkSweep::gc_tracer();
+  gc_tracer->report_gc_start(gch->gc_cause(), gc_timer->gc_start());
+
+  gch->pre_full_gc_dump(gc_timer);
+
+  // 使用 mark-compact 标记-整理(压缩)法 收集垃圾
+  GenMarkSweep::invoke_at_safepoint(clear_all_soft_refs);
+
+  gch->post_full_gc_dump(gc_timer);
+
+  gc_timer->register_gc_end();
+
+  gc_tracer->report_gc_end(gc_timer->gc_end(), gc_timer->time_partitions());
+}
+```
+
+```c++
+void GenMarkSweep::invoke_at_safepoint(bool clear_all_softrefs) {
+  assert(SafepointSynchronize::is_at_safepoint(), "must be at a safepoint");
+
+  SerialHeap* gch = SerialHeap::heap();
+#ifdef ASSERT
+  if (gch->soft_ref_policy()->should_clear_all_soft_refs()) {
+    assert(clear_all_softrefs, "Policy should have been checked earlier");
+  }
+#endif
+
+  gch->trace_heap_before_gc(_gc_tracer);
+
+  // Increment the invocation count
+  _total_invocations++;
+
+  // Capture used regions for old-gen to reestablish old-to-young invariant
+  // after full-gc.
+  gch->old_gen()->save_used_region();
+
+  allocate_stacks();
+
+  phase1_mark(clear_all_softrefs);
+
+  // 整理操作封装在 Compacter 类中
+  Compacter compacter{gch};
+
+  {
+    // Now all live objects are marked, compute the new object addresses.
+    GCTraceTime(Info, gc, phases) tm("Phase 2: Compute new object addresses", _gc_timer);
+
+    compacter.phase2_calculate_new_addr();
+  }
+
+  // Don't add any more derived pointers during phase3
+#if COMPILER2_OR_JVMCI
+  assert(DerivedPointerTable::is_active(), "Sanity");
+  DerivedPointerTable::set_active(false);
+#endif
+
+  {
+    // Adjust the pointers to reflect the new locations
+    GCTraceTime(Info, gc, phases) tm("Phase 3: Adjust pointers", gc_timer());
+
+    ClassLoaderDataGraph::verify_claimed_marks_cleared(ClassLoaderData::_claim_stw_fullgc_adjust);
+
+    CodeBlobToOopClosure code_closure(&adjust_pointer_closure, CodeBlobToOopClosure::FixRelocations);
+    gch->process_roots(SerialHeap::SO_AllCodeCache,
+                       &adjust_pointer_closure,
+                       &adjust_cld_closure,
+                       &adjust_cld_closure,
+                       &code_closure);
+
+    WeakProcessor::oops_do(&adjust_pointer_closure);
+
+    adjust_marks();
+    compacter.phase3_adjust_pointers();
+  }
+
+  {
+    // All pointers are now adjusted, move objects accordingly
+    GCTraceTime(Info, gc, phases) tm("Phase 4: Move objects", _gc_timer);
+
+    compacter.phase4_compact();
+  }
+
+  restore_marks();
+
+  // Set saved marks for allocation profiler (and other things? -- dld)
+  // (Should this be in general part?)
+  gch->save_marks();
+
+  deallocate_stacks();
+
+  MarkSweep::_string_dedup_requests->flush();
+
+  bool is_young_gen_empty = (gch->young_gen()->used() == 0);
+  gch->rem_set()->maintain_old_to_young_invariant(gch->old_gen(), is_young_gen_empty);
+
+  gch->prune_scavengable_nmethods();
+
+  // Update heap occupancy information which is used as
+  // input to soft ref clearing policy at the next gc.
+  Universe::heap()->update_capacity_and_used_at_gc();
+
+  // Signal that we have completed a visit to all live objects.
+  Universe::heap()->record_whole_heap_examined_timestamp();
+
+  gch->trace_heap_after_gc(_gc_tracer);
+}
+```
+
 #### 🗑ParallelScavengeHeap
+
+##### 🍸内存分配
+
+```c++
+// ParallelScavengeHeap is the implementation of CollectedHeap for Parallel GC.
+//
+// The heap is reserved up-front in a single contiguous block, split into two
+// parts, the old and young generation. The old generation resides at lower
+// addresses, the young generation at higher addresses. The boundary address
+// between the generations is fixed. Within a generation, committed memory
+// grows towards higher addresses.
+//
+//
+// low                                                                high
+//
+//                          +-- generation boundary (fixed after startup)
+//                          |
+// |<- old gen (reserved) ->|<-       young gen (reserved)             ->|
+// +---------------+--------+-----------------+--------+--------+--------+
+// |      old      |        |       eden      |  from  |   to   |        |
+// |               |        |                 |  (to)  | (from) |        |
+// +---------------+--------+-----------------+--------+--------+--------+
+// |<- committed ->|        |<-          committed            ->|
+//
+class ParallelScavengeHeap : public CollectedHeap {
+  friend class VMStructs;
+ private:
+  static PSYoungGen* _young_gen;
+  static PSOldGen*   _old_gen;
+
+  // Sizing policy for entire heap
+  static PSAdaptiveSizePolicy*       _size_policy;
+  static PSGCAdaptivePolicyCounters* _gc_policy_counters;
+  // ...
+}
+```
+
+```c++
+void PSYoungGen::initialize_work() {
+
+  _reserved = MemRegion((HeapWord*)virtual_space()->low_boundary(),
+                        (HeapWord*)virtual_space()->high_boundary());
+  assert(_reserved.byte_size() == max_gen_size(), "invariant");
+
+  MemRegion cmr((HeapWord*)virtual_space()->low(),
+                (HeapWord*)virtual_space()->high());
+  ParallelScavengeHeap::heap()->card_table()->resize_covered_region(cmr);
+
+  if (ZapUnusedHeapArea) {
+    // Mangle newly committed space immediately because it
+    // can be done here more simply that after the new
+    // spaces have been computed.
+    SpaceMangler::mangle_region(cmr);
+  }
+
+  if (UseNUMA) {
+    _eden_space = new MutableNUMASpace(virtual_space()->alignment());
+  } else {
+    _eden_space = new MutableSpace(virtual_space()->alignment());
+  }
+  _from_space = new MutableSpace(virtual_space()->alignment());
+  _to_space   = new MutableSpace(virtual_space()->alignment());
+
+  // Generation Counters - generation 0, 3 subspaces
+  _gen_counters = new PSGenerationCounters("new", 0, 3, min_gen_size(),
+                                           max_gen_size(), virtual_space());
+
+  // Compute maximum space sizes for performance counters
+  size_t alignment = SpaceAlignment;
+  size_t size = virtual_space()->reserved_size();
+
+  size_t max_survivor_size;
+  size_t max_eden_size;
+
+  if (UseAdaptiveSizePolicy) {
+    max_survivor_size = size / MinSurvivorRatio;
+
+    // round the survivor space size down to the nearest alignment
+    // and make sure its size is greater than 0.
+    max_survivor_size = align_down(max_survivor_size, alignment);
+    max_survivor_size = MAX2(max_survivor_size, alignment);
+
+    // set the maximum size of eden to be the size of the young gen
+    // less two times the minimum survivor size. The minimum survivor
+    // size for UseAdaptiveSizePolicy is one alignment.
+    max_eden_size = size - 2 * alignment;
+  } else {
+    max_survivor_size = size / InitialSurvivorRatio;
+
+    // round the survivor space size down to the nearest alignment
+    // and make sure its size is greater than 0.
+    max_survivor_size = align_down(max_survivor_size, alignment);
+    max_survivor_size = MAX2(max_survivor_size, alignment);
+
+    // set the maximum size of eden to be the size of the young gen
+    // less two times the survivor size when the generation is 100%
+    // committed. The minimum survivor size for -UseAdaptiveSizePolicy
+    // is dependent on the committed portion (current capacity) of the
+    // generation - the less space committed, the smaller the survivor
+    // space, possibly as small as an alignment. However, we are interested
+    // in the case where the young generation is 100% committed, as this
+    // is the point where eden reaches its maximum size. At this point,
+    // the size of a survivor space is max_survivor_size.
+    max_eden_size = size - 2 * max_survivor_size;
+  }
+
+  _eden_counters = new SpaceCounters("eden", 0, max_eden_size, _eden_space,
+                                     _gen_counters);
+  _from_counters = new SpaceCounters("s0", 1, max_survivor_size, _from_space,
+                                     _gen_counters);
+  _to_counters = new SpaceCounters("s1", 2, max_survivor_size, _to_space,
+                                   _gen_counters);
+
+  compute_initial_space_boundaries();
+}
+```
+
+
+
+##### 🍸垃圾回收
+
+```C++
+void ParallelScavengeHeap::collect(GCCause::Cause cause) {
+  assert(!Heap_lock->owned_by_self(),
+    "this thread should not own the Heap_lock");
+
+  uint gc_count      = 0;
+  uint full_gc_count = 0;
+  {
+    MutexLocker ml(Heap_lock);
+    // This value is guarded by the Heap_lock
+    gc_count      = total_collections();
+    full_gc_count = total_full_collections();
+  }
+
+  if (GCLocker::should_discard(cause, gc_count)) {
+    return;
+  }
+
+  while (true) {
+    VM_ParallelGCSystemGC op(gc_count, full_gc_count, cause);
+    VMThread::execute(&op);
+
+    if (!GCCause::is_explicit_full_gc(cause) || op.full_gc_succeeded()) {
+      return;
+    }
+
+    {
+      MutexLocker ml(Heap_lock);
+      if (full_gc_count != total_full_collections()) {
+        return;
+      }
+    }
+
+    if (GCLocker::is_active_and_needs_gc()) {
+      // If GCLocker is active, wait until clear before retrying.
+      GCLocker::stall_until_clear();
+    }
+  }
+}
+```
+
+```C++
+void VM_ParallelGCSystemGC::doit() {
+  SvcGCMarker sgcm(SvcGCMarker::FULL);
+
+  ParallelScavengeHeap* heap = ParallelScavengeHeap::heap();
+
+  GCCauseSetter gccs(heap, _gc_cause);
+  if (!_full) {
+    // If (and only if) the scavenge fails, this will invoke a full gc.
+    _full_gc_succeeded = heap->invoke_scavenge();
+  } else {
+    _full_gc_succeeded = PSParallelCompact::invoke(false);
+  }
+}
+
+inline bool ParallelScavengeHeap::invoke_scavenge() {
+  return PSScavenge::invoke();
+}
+```
+
+```c++
+void VMThread::execute(VM_Operation* op) {
+  Thread* t = Thread::current();
+
+  if (t->is_VM_thread()) {
+    op->set_calling_thread(t);
+    ((VMThread*)t)->inner_execute(op);
+    return;
+  }
+  // ...
+}
+
+void VMThread::inner_execute(VM_Operation* op) {
+  assert(Thread::current()->is_VM_thread(), "Must be the VM thread");
+
+  VM_Operation* prev_vm_operation = nullptr;
+  if (_cur_vm_operation != nullptr) {
+    // Check that the VM operation allows nested VM operation.
+    // This is normally not the case, e.g., the compiler
+    // does not allow nested scavenges or compiles.
+    if (!_cur_vm_operation->allow_nested_vm_operations()) {
+      fatal("Unexpected nested VM operation %s requested by operation %s",
+            op->name(), _cur_vm_operation->name());
+    }
+    op->set_calling_thread(_cur_vm_operation->calling_thread());
+    prev_vm_operation = _cur_vm_operation;
+  }
+
+  _cur_vm_operation = op;
+
+  HandleMark hm(VMThread::vm_thread());
+
+  const char* const cause = op->cause();
+  EventMarkVMOperation em("Executing %sVM operation: %s%s%s%s",
+      prev_vm_operation != nullptr ? "nested " : "",
+      op->name(),
+      cause != nullptr ? " (" : "",
+      cause != nullptr ? cause : "",
+      cause != nullptr ? ")" : "");
+
+  log_debug(vmthread)("Evaluating %s %s VM operation: %s",
+                       prev_vm_operation != nullptr ? "nested" : "",
+                      _cur_vm_operation->evaluate_at_safepoint() ? "safepoint" : "non-safepoint",
+                      _cur_vm_operation->name());
+
+  bool end_safepoint = false;
+  bool has_timeout_task = (_timeout_task != nullptr);
+  if (_cur_vm_operation->evaluate_at_safepoint() &&
+      !SafepointSynchronize::is_at_safepoint()) {
+    SafepointSynchronize::begin();
+    if (has_timeout_task) {
+      _timeout_task->arm(_cur_vm_operation->name());
+    }
+    end_safepoint = true;
+  }
+
+  evaluate_operation(_cur_vm_operation);
+
+  if (end_safepoint) {
+    if (has_timeout_task) {
+      _timeout_task->disarm();
+    }
+    SafepointSynchronize::end();
+  }
+
+  _cur_vm_operation = prev_vm_operation;
+}
+```
+
+```c++
+// This method contains all heap specific policy for invoking scavenge.
+// PSScavenge::invoke_no_policy() will do nothing but attempt to
+// scavenge. It will not clean up after failed promotions, bail out if
+// we've exceeded policy time limits, or any other special behavior.
+// All such policy should be placed here.
+//
+// Note that this method should only be called from the vm_thread while
+// at a safepoint!
+bool PSScavenge::invoke() {
+  assert(SafepointSynchronize::is_at_safepoint(), "should be at safepoint");
+  assert(Thread::current() == (Thread*)VMThread::vm_thread(), "should be in vm thread");
+  assert(!ParallelScavengeHeap::heap()->is_gc_active(), "not reentrant");
+
+  ParallelScavengeHeap* const heap = ParallelScavengeHeap::heap();
+  PSAdaptiveSizePolicy* policy = heap->size_policy();
+  IsGCActiveMark mark;
+
+  const bool scavenge_done = PSScavenge::invoke_no_policy();
+  const bool need_full_gc = !scavenge_done;
+  bool full_gc_done = false;
+
+  if (UsePerfData) {
+    PSGCAdaptivePolicyCounters* const counters = heap->gc_policy_counters();
+    const int ffs_val = need_full_gc ? full_follows_scavenge : not_skipped;
+    counters->update_full_follows_scavenge(ffs_val);
+  }
+
+  if (need_full_gc) {
+    GCCauseSetter gccs(heap, GCCause::_adaptive_size_policy);
+    SoftRefPolicy* srp = heap->soft_ref_policy();
+    const bool clear_all_softrefs = srp->should_clear_all_soft_refs();
+
+    full_gc_done = PSParallelCompact::invoke_no_policy(clear_all_softrefs);
+  }
+
+  return full_gc_done;
+}
+```
+
+#### 🗑G1CollectedHeap
+
+##### 🍸内存分配
+
+###### TLAB 慢分配
+
+```c++
+HeapWord* G1CollectedHeap::allocate_new_tlab(size_t min_size,
+                                             size_t requested_size,
+                                             size_t* actual_size) {
+  assert_heap_not_locked_and_not_at_safepoint();
+  assert(!is_humongous(requested_size), "we do not allow humongous TLABs");
+
+  return attempt_allocation(min_size, requested_size, actual_size);
+}
+
+inline HeapWord* G1CollectedHeap::attempt_allocation(size_t min_word_size,
+                                                     size_t desired_word_size,
+                                                     size_t* actual_word_size) {
+  assert_heap_not_locked_and_not_at_safepoint();
+  assert(!is_humongous(desired_word_size), "attempt_allocation() should not "
+         "be called for humongous allocation requests");
+
+  HeapWord* result = _allocator->attempt_allocation(min_word_size, desired_word_size, actual_word_size);
+
+  if (result == nullptr) {
+    *actual_word_size = desired_word_size;
+    result = attempt_allocation_slow(desired_word_size);
+  }
+
+  assert_heap_not_locked();
+  if (result != nullptr) {
+    assert(*actual_word_size != 0, "Actual size must have been set here");
+    dirty_young_block(result, *actual_word_size);
+  } else {
+    *actual_word_size = 0;
+  }
+
+  return result;
+}
+
+inline HeapWord* G1Allocator::attempt_allocation(size_t min_word_size,
+                                                 size_t desired_word_size,
+                                                 size_t* actual_word_size) {
+  uint node_index = current_node_index();
+
+  HeapWord* result = mutator_alloc_region(node_index)->attempt_retained_allocation(min_word_size, desired_word_size, actual_word_size);
+  if (result != nullptr) {
+    return result;
+  }
+
+  return mutator_alloc_region(node_index)->attempt_allocation(min_word_size, desired_word_size, actual_word_size);
+}
+```
+
+##### 🍸垃圾回收
 
 #### 🗑ShenandoahHeap
 
