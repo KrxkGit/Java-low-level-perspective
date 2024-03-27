@@ -4696,7 +4696,7 @@ HeapWord* SerialHeap::mem_allocate_work(size_t size,
       log_trace(gc, alloc)("SerialHeap::mem_allocate_work: attempting locked slow path allocation");
       // Note that only large objects get a shot at being
       // allocated in later generations.
-      // 大对象有机会在 年老代 分配
+      // 仅大对象有机会在 年老代 分配
       bool first_only = !should_try_older_generation_allocation(size);
 
       result = attempt_allocation(size, is_tlab, first_only);
@@ -5003,9 +5003,119 @@ void SafepointSynchronize::disarm_safepoint() {
 }
 ```
 
-
-
 ##### 🍸垃圾回收
+
+###### ⏲触发时机
+
+```c++
+HeapWord* SerialHeap::mem_allocate_work(size_t size,
+                                        bool is_tlab) {
+
+ 	//...
+    VM_GenCollectForAllocation op(size, is_tlab, gc_count_before);
+    VMThread::execute(&op);
+    // ...
+}
+```
+
+```c++
+void VM_GenCollectForAllocation::doit() {
+  SvcGCMarker sgcm(SvcGCMarker::MINOR);
+
+  SerialHeap* gch = SerialHeap::heap();
+  GCCauseSetter gccs(gch, _gc_cause);
+  _result = gch->satisfy_failed_allocation(_word_size, _tlab);
+  assert(_result == nullptr || gch->is_in_reserved(_result), "result not in heap");
+
+  if (_result == nullptr && GCLocker::is_active_and_needs_gc()) {
+    set_gc_locked();
+  }
+}
+```
+
+```c++
+// Callback from VM_GenCollectForAllocation operation.
+// This function does everything necessary/possible to satisfy an
+// allocation request that failed in the youngest generation that should
+// have handled it (including collection, expansion, etc.)
+HeapWord* SerialHeap::satisfy_failed_allocation(size_t size, bool is_tlab) {
+  GCCauseSetter x(this, GCCause::_allocation_failure);
+  HeapWord* result = nullptr;
+
+  assert(size != 0, "Precondition violated");
+  if (GCLocker::is_active_and_needs_gc()) {
+    // GC locker is active; instead of a collection we will attempt
+    // to expand the heap, if there's room for expansion.
+    if (!is_maximal_no_gc()) {
+      result = expand_heap_and_allocate(size, is_tlab);
+    }
+    return result;   // Could be null if we are out of space.
+  } else if (!incremental_collection_will_fail(false /* don't consult_young */)) {
+    // Do an incremental collection.
+    do_collection(false,                     // full
+                  false,                     // clear_all_soft_refs
+                  size,                      // size
+                  is_tlab,                   // is_tlab
+                  SerialHeap::OldGen); // max_generation
+  } else {
+    log_trace(gc)(" :: Trying full because partial may fail :: ");
+    // Try a full collection; see delta for bug id 6266275
+    // for the original code and why this has been simplified
+    // with from-space allocation criteria modified and
+    // such allocation moved out of the safepoint path.
+    do_collection(true,                      // full
+                  false,                     // clear_all_soft_refs
+                  size,                      // size
+                  is_tlab,                   // is_tlab
+                  SerialHeap::OldGen); // max_generation
+  }
+
+  result = attempt_allocation(size, is_tlab, false /*first_only*/);
+
+  if (result != nullptr) {
+    assert(is_in_reserved(result), "result not in heap");
+    return result;
+  }
+
+  // OK, collection failed, try expansion.
+  result = expand_heap_and_allocate(size, is_tlab);
+  if (result != nullptr) {
+    return result;
+  }
+
+  // If we reach this point, we're really out of memory. Try every trick
+  // we can to reclaim memory. Force collection of soft references. Force
+  // a complete compaction of the heap. Any additional methods for finding
+  // free memory should be here, especially if they are expensive. If this
+  // attempt fails, an OOM exception will be thrown.
+  {
+    UIntFlagSetting flag_change(MarkSweepAlwaysCompactCount, 1); // Make sure the heap is fully compacted
+
+    do_collection(true,                      // full
+                  true,                      // clear_all_soft_refs
+                  size,                      // size
+                  is_tlab,                   // is_tlab
+                  SerialHeap::OldGen); // max_generation
+  }
+
+  result = attempt_allocation(size, is_tlab, false /* first_only */);
+  if (result != nullptr) {
+    assert(is_in_reserved(result), "result not in heap");
+    return result;
+  }
+
+  assert(!soft_ref_policy()->should_clear_all_soft_refs(),
+    "Flag should have been handled and cleared prior to this point");
+
+  // What else?  We might try synchronous finalization later.  If the total
+  // space available is large enough for the allocation, then a more
+  // complete compaction phase than we've tried so far might be
+  // appropriate.
+  return nullptr;
+}
+```
+
+###### 🔨System.gc()
 
 ```c++
 // public collection interfaces
@@ -5582,6 +5692,8 @@ void GenMarkSweep::invoke_at_safepoint(bool clear_all_softrefs) {
 
 #### 🗑ParallelScavengeHeap
 
+ParallelScavenge 利用各种适应性策略以提高吞吐量。
+
 ##### 🍸内存分配
 
 ```c++
@@ -5697,8 +5809,6 @@ void PSYoungGen::initialize_work() {
   compute_initial_space_boundaries();
 }
 ```
-
-
 
 ##### 🍸垃圾回收
 
@@ -5918,6 +6028,7 @@ inline HeapWord* G1Allocator::attempt_allocation(size_t min_word_size,
                                                  size_t* actual_word_size) {
   uint node_index = current_node_index();
 
+  // 在 Region 上分配
   HeapWord* result = mutator_alloc_region(node_index)->attempt_retained_allocation(min_word_size, desired_word_size, actual_word_size);
   if (result != nullptr) {
     return result;
@@ -5927,11 +6038,595 @@ inline HeapWord* G1Allocator::attempt_allocation(size_t min_word_size,
 }
 ```
 
+###### 直接在堆上分配
+
+```c++
+HeapWord*
+G1CollectedHeap::mem_allocate(size_t word_size,
+                              bool*  gc_overhead_limit_was_exceeded) {
+  assert_heap_not_locked_and_not_at_safepoint();
+
+  if (is_humongous(word_size)) {
+    return attempt_allocation_humongous(word_size);
+  }
+  size_t dummy = 0;
+  return attempt_allocation(word_size, word_size, &dummy);
+}
+```
+
 ##### 🍸垃圾回收
+
+###### RSet
+
+```c++
+// A G1RemSet in which each heap region has a rem set that records the
+// external heap references into it.  Uses a mod ref bs to track updates,
+// so that they can be used to update the individual region remsets.
+class G1RemSet: public CHeapObj<mtGC> {
+public:
+  typedef CardTable::CardValue CardValue;
+
+private:
+  G1RemSetScanState* _scan_state;
+
+  G1RemSetSummary _prev_period_summary;
+
+  G1CollectedHeap* _g1h;
+
+  G1CardTable*           _ct;
+  G1Policy*              _g1p;
+
+  void print_merge_heap_roots_stats();
+
+  void assert_scan_top_is_null(uint hrm_index) NOT_DEBUG_RETURN;
+
+  void enqueue_for_reprocessing(CardValue* card_ptr);
+
+public:
+  // Initialize data that depends on the heap size being known.
+  void initialize(uint max_reserved_regions);
+
+  G1RemSet(G1CollectedHeap* g1h, G1CardTable* ct);
+  ~G1RemSet();
+
+  // Scan all cards in the non-collection set regions that potentially contain
+  // references into the current whole collection set.
+  void scan_heap_roots(G1ParScanThreadState* pss,
+                       uint worker_id,
+                       G1GCPhaseTimes::GCParPhases scan_phase,
+                       G1GCPhaseTimes::GCParPhases objcopy_phase,
+                       bool remember_already_scanned_cards);
+
+  // Merge cards from various sources (remembered sets, log buffers)
+  // and calculate the cards that need to be scanned later (via scan_heap_roots()).
+  // If initial_evacuation is set, this is called during the initial evacuation.
+  void merge_heap_roots(bool initial_evacuation);
+
+  void complete_evac_phase(bool has_more_than_one_evacuation_phase);
+  // Prepare for and cleanup after scanning the heap roots. Must be called
+  // once before and after in sequential code.
+  void prepare_for_scan_heap_roots();
+
+  // Print coarsening stats.
+  void print_coarsen_stats();
+  // Creates a task for cleaining up temporary data structures and the
+  // card table, removing temporary duplicate detection information.
+  G1AbstractSubTask* create_cleanup_after_scan_heap_roots_task();
+  // Excludes the given region from heap root scanning.
+  void exclude_region_from_scan(uint region_idx);
+  // Creates a snapshot of the current _top values at the start of collection to
+  // filter out card marks that we do not want to scan.
+  void prepare_region_for_scan(HeapRegion* region);
+
+  // Do work for regions in the current increment of the collection set, scanning
+  // non-card based (heap) roots.
+  void scan_collection_set_regions(G1ParScanThreadState* pss,
+                                   uint worker_id,
+                                   G1GCPhaseTimes::GCParPhases scan_phase,
+                                   G1GCPhaseTimes::GCParPhases coderoots_phase,
+                                   G1GCPhaseTimes::GCParPhases objcopy_phase);
+
+  // Two methods for concurrent refinement support, executed concurrently to
+  // the mutator:
+  // Cleans the card at "*card_ptr_addr" before refinement, returns true iff the
+  // card needs later refinement.
+  bool clean_card_before_refine(CardValue** const card_ptr_addr);
+  // Refine the region corresponding to "card_ptr". Must be called after
+  // being filtered by clean_card_before_refine(), and after proper
+  // fence/synchronization.
+  void refine_card_concurrently(CardValue* const card_ptr,
+                                const uint worker_id);
+
+  // Print accumulated summary info from the start of the VM.
+  void print_summary_info();
+
+  // Print accumulated summary info from the last time called.
+  void print_periodic_summary_info(const char* header, uint period_count, bool show_thread_times);
+};
+```
+
+###### CSet
+
+```c++
+class G1CollectionSet {
+  G1CollectedHeap* _g1h;
+  G1Policy* _policy;
+
+  // All old gen collection set candidate regions.
+  G1CollectionSetCandidates _candidates;
+
+  // The actual collection set as a set of region indices.
+  // All entries in _collection_set_regions below _collection_set_cur_length are
+  // assumed to be part of the collection set.
+  // We assume that at any time there is at most only one writer and (one or more)
+  // concurrent readers. This means we are good with using storestore and loadload
+  // barriers on the writer and reader respectively only.
+  uint* _collection_set_regions;
+  volatile uint _collection_set_cur_length;
+  uint _collection_set_max_length;
+
+  uint _eden_region_length;
+  uint _survivor_region_length;
+  uint _initial_old_region_length;
+
+  // When doing mixed collections we can add old regions to the collection set, which
+  // will be collected only if there is enough time. We call these optional (old) regions.
+  G1CollectionCandidateRegionList _optional_old_regions;
+
+  enum CSetBuildType {
+    Active,             // We are actively building the collection set
+    Inactive            // We are not actively building the collection set
+  };
+
+  CSetBuildType _inc_build_state;
+  size_t _inc_part_start;
+
+  G1CollectorState* collector_state() const;
+  G1GCPhaseTimes* phase_times();
+
+  void verify_young_cset_indices() const NOT_DEBUG_RETURN;
+
+  // Update the incremental collection set information when adding a region.
+  void add_young_region_common(HeapRegion* hr);
+
+  // Add the given old region to the head of the current collection set.
+  void add_old_region(HeapRegion* hr);
+
+  void move_candidates_to_collection_set(G1CollectionCandidateRegionList* regions);
+  // Prepares old regions in the given set for optional collection later. Does not
+  // add the region to collection set yet.
+  void prepare_optional_regions(G1CollectionCandidateRegionList* regions);
+  // Moves given old regions from the marking candidates to the retained candidates.
+  // This makes sure that marking candidates will not remain there to unnecessarily
+  // prolong the mixed phase.
+  void move_pinned_marking_to_retained(G1CollectionCandidateRegionList* regions);
+  // Removes the given list of regions from the retained candidates.
+  void drop_pinned_retained_regions(G1CollectionCandidateRegionList* regions);
+
+  // Finalize the young part of the initial collection set. Relabel survivor regions
+  // as Eden and calculate a prediction on how long the evacuation of all young regions
+  // will take.
+  double finalize_young_part(double target_pause_time_ms, G1SurvivorRegions* survivors);
+  // Perform any final calculations on the incremental collection set fields before we
+  // can use them.
+  void finalize_incremental_building();
+
+  // Select the regions comprising the initial and optional collection set from marking
+  // and retained collection set candidates.
+  void finalize_old_part(double time_remaining_ms);
+
+  // Iterate the part of the collection set given by the offset and length applying the given
+  // HeapRegionClosure. The worker_id will determine where in the part to start the iteration
+  // to allow for more efficient parallel iteration.
+  void iterate_part_from(HeapRegionClosure* cl,
+                         HeapRegionClaimer* hr_claimer,
+                         size_t offset,
+                         size_t length,
+                         uint worker_id) const;
+public:
+  G1CollectionSet(G1CollectedHeap* g1h, G1Policy* policy);
+  ~G1CollectionSet();
+
+  // Initializes the collection set giving the maximum possible length of the collection set.
+  void initialize(uint max_region_length);
+
+  void abandon_all_candidates();
+
+  G1CollectionSetCandidates* candidates() { return &_candidates; }
+  const G1CollectionSetCandidates* candidates() const { return &_candidates; }
+
+  void init_region_lengths(uint eden_cset_region_length,
+                           uint survivor_cset_region_length);
+
+  uint region_length() const       { return young_region_length() +
+                                            initial_old_region_length(); }
+  uint young_region_length() const { return eden_region_length() +
+                                            survivor_region_length(); }
+
+  uint eden_region_length() const     { return _eden_region_length; }
+  uint survivor_region_length() const { return _survivor_region_length; }
+  uint initial_old_region_length() const      { return _initial_old_region_length; }
+  uint optional_region_length() const { return _optional_old_regions.length(); }
+
+  bool only_contains_young_regions() const { return (initial_old_region_length() + optional_region_length()) == 0; }
+
+  // Reset the contents of the collection set.
+  void clear();
+
+  // Incremental collection set support
+
+  // Initialize incremental collection set info.
+  void start_incremental_building();
+  // Start a new collection set increment.
+  void update_incremental_marker() { _inc_build_state = Active; _inc_part_start = _collection_set_cur_length; }
+  // Stop adding regions to the current collection set increment.
+  void stop_incremental_building() { _inc_build_state = Inactive; }
+
+  // Iterate over the current collection set increment applying the given HeapRegionClosure
+  // from a starting position determined by the given worker id.
+  void iterate_incremental_part_from(HeapRegionClosure* cl, HeapRegionClaimer* hr_claimer, uint worker_id) const;
+
+  // Returns the length of the current increment in number of regions.
+  size_t increment_length() const { return _collection_set_cur_length - _inc_part_start; }
+  // Returns the length of the whole current collection set in number of regions
+  size_t cur_length() const { return _collection_set_cur_length; }
+
+  // Iterate over the entire collection set (all increments calculated so far), applying
+  // the given HeapRegionClosure on all of them.
+  void iterate(HeapRegionClosure* cl) const;
+  void par_iterate(HeapRegionClosure* cl,
+                   HeapRegionClaimer* hr_claimer,
+                   uint worker_id) const;
+
+  void iterate_optional(HeapRegionClosure* cl) const;
+
+  // Finalize the initial collection set consisting of all young regions potentially a
+  // few old gen regions.
+  void finalize_initial_collection_set(double target_pause_time_ms, G1SurvivorRegions* survivor);
+  // Finalize the next collection set from the set of available optional old gen regions.
+  bool finalize_optional_for_evacuation(double remaining_pause_time);
+  // Abandon (clean up) optional collection set regions that were not evacuated in this
+  // pause.
+  void abandon_optional_collection_set(G1ParScanThreadStateSet* pss);
+
+  // Add eden region to the collection set.
+  void add_eden_region(HeapRegion* hr);
+
+  // Add survivor region to the collection set.
+  void add_survivor_regions(HeapRegion* hr);
+
+#ifndef PRODUCT
+  bool verify_young_ages();
+
+  void print(outputStream* st);
+#endif // !PRODUCT
+};
+```
+
+###### 卡表
+
+g1 将 region 分为多个卡，并维护一个全局卡表，用于提高重新标记效率。
+
+###### ✨读写屏障
+
+```c++
+jint G1CollectedHeap::initialize() {
+    // ...
+	// Create the barrier set for the entire reserved region.
+  G1CardTable* ct = new G1CardTable(heap_rs.region());
+  G1BarrierSet* bs = new G1BarrierSet(ct);
+  bs->initialize();
+  assert(bs->is_a(BarrierSet::G1BarrierSet), "sanity");
+  BarrierSet::set_barrier_set(bs);
+  //...
+}
+```
+
+###### ✨三色标记法
+
+> 1. 开始时所有对象为白色，表示未扫描或垃圾状态；灰色表示需要继续扫描，黑色表示扫描停止且存活。
+> 2. 初始标记阶段，指的是标记 GCRoots 直接引用的节点，将它们标记为**灰色**，这个阶段需要 「Stop the World」。
+> 3. 并发标记阶段，指的是从灰色节点开始，去扫描整个引用链，然后将它们标记为**黑色**，这个阶段不需要「Stop the World」。
+> 4. 重新标记阶段，指的是去校正并发标记阶段的错误，这个阶段需要「Stop the World」。
+> 5. 并发清除，指的是将已经确定为垃圾的对象清除掉，这个阶段不需要「Stop the World」
+
+上述步骤可能出现问题是步骤 2，因为该过程可能因为用户线程产生或删除新的引用关系，可能出现多标或**漏标**，其中漏标将影响程序功能，必须被解决。
+
+下列伪代码反映了漏标的场景：
+
+```javascript
+var G = objE.fieldG; // field_ 表示引用的对象 (读)
+objE.fieldG = null;  // 灰色 E 断开引用 白色G (写)
+objD.fieldG = G;  // 黑色D 引用 白色G (写)
+```
+
+漏标的充要条件如下：
+
+> 1.  有至少一个黑色对象在自己被标记之后指向了这个白色对象。
+> 2.  所有的灰色对象在自己引用扫描完成之前删除了对白色对象的引用。
+
+只要破坏其中一个条件即可，故对应两种方式
+
+> 1. 增量更新
+> 2. 原始快照
+
+CMS 采用方案 1，G1  采用方案 2。
+
+> - 为了防止灰色对象被扫描完成之前删除对白色对象的引用，在此之前，先将灰色对象指向的白色对象引用关系保存下来(即标记该白色对象为灰色)，然后在重新标记阶段就行重新扫描。
+> - 在上述伪代码第2行，可以添加一个写屏障，以便记录G，将此标记为灰色。
+> - 为了避免重新标记阶段受到干扰，此步需要STW。
+
+###### ✨效益优先收集
+
+标记完成后，需要收集的垃圾保存在CSet中，G1收集器通过计算 Region 的垃圾百分比选取效益较高的 Region 进行优先收集。此步**需要 STW**。
+
+```c++
+void G1CollectedHeap::collect(GCCause::Cause cause) {
+  try_collect(cause, collection_counters(this));
+}
+
+bool G1CollectedHeap::try_collect(GCCause::Cause cause,
+                                  const G1GCCounters& counters_before) {
+  if (should_do_concurrent_full_gc(cause)) {
+    return try_collect_concurrently(cause,
+                                    counters_before.total_collections(),
+                                    counters_before.old_marking_cycles_started());
+  } else if (cause == GCCause::_gc_locker || cause == GCCause::_wb_young_gc
+             DEBUG_ONLY(|| cause == GCCause::_scavenge_alot)) {
+
+    // Schedule a standard evacuation pause. We're setting word_size
+    // to 0 which means that we are not requesting a post-GC allocation.
+    VM_G1CollectForAllocation op(0,     /* word_size */
+                                 counters_before.total_collections(),
+                                 cause);
+    VMThread::execute(&op);
+    return op.gc_succeeded();
+  } else {
+    // Schedule a Full GC.
+    return try_collect_fullgc(cause, counters_before);
+  }
+}
+```
+
+```c++
+void VM_G1CollectForAllocation::doit() {
+  G1CollectedHeap* g1h = G1CollectedHeap::heap();
+
+  GCCauseSetter x(g1h, _gc_cause);
+  // Try a partial collection of some kind.
+  _gc_succeeded = g1h->do_collection_pause_at_safepoint();
+  assert(_gc_succeeded, "no reason to fail");
+
+  if (_word_size > 0) {
+    // An allocation had been requested. Do it, eventually trying a stronger
+    // kind of GC.
+    _result = g1h->satisfy_failed_allocation(_word_size, &_gc_succeeded);
+  } else if (g1h->should_upgrade_to_full_gc()) {
+    // There has been a request to perform a GC to free some space. We have no
+    // information on how much memory has been asked for. In case there are
+    // absolutely no regions left to allocate into, do a full compaction.
+    _gc_succeeded = g1h->upgrade_to_full_collection();
+  }
+}
+```
+
+```c++
+bool G1CollectedHeap::do_collection_pause_at_safepoint() {
+  assert_at_safepoint_on_vm_thread();
+  guarantee(!is_gc_active(), "collection is not reentrant");
+
+  do_collection_pause_at_safepoint_helper();
+  return true;
+}
+
+void G1CollectedHeap::do_collection_pause_at_safepoint_helper() {
+  ResourceMark rm;
+
+  IsGCActiveMark active_gc_mark;
+  GCIdMark gc_id_mark;
+  SvcGCMarker sgcm(SvcGCMarker::MINOR);
+
+  GCTraceCPUTime tcpu(_gc_tracer_stw);
+
+  _bytes_used_during_gc = 0;
+
+  policy()->decide_on_concurrent_start_pause();
+  // Record whether this pause may need to trigger a concurrent operation. Later,
+  // when we signal the G1ConcurrentMarkThread, the collector state has already
+  // been reset for the next pause.
+  bool should_start_concurrent_mark_operation = collector_state()->in_concurrent_start_gc();
+
+  // Perform the collection.
+  G1YoungCollector collector(gc_cause());
+  collector.collect();
+
+  // It should now be safe to tell the concurrent mark thread to start
+  // without its logging output interfering with the logging output
+  // that came from the pause.
+  if (should_start_concurrent_mark_operation) {
+    verifier()->verify_bitmap_clear(true /* above_tams_only */);
+    // CAUTION: after the start_concurrent_cycle() call below, the concurrent marking
+    // thread(s) could be running concurrently with us. Make sure that anything
+    // after this point does not assume that we are the only GC thread running.
+    // Note: of course, the actual marking work will not start until the safepoint
+    // itself is released in SuspendibleThreadSet::desynchronize().
+    start_concurrent_cycle(collector.concurrent_operation_is_full_mark());
+    ConcurrentGCBreakpoints::notify_idle_to_active();
+  }
+}
+```
+
+```c++
+void G1YoungCollector::collect() {
+  // Do timing/tracing/statistics/pre- and post-logging/verification work not
+  // directly related to the collection. They should not be accounted for in
+  // collection work timing.
+
+  // The G1YoungGCTraceTime message depends on collector state, so must come after
+  // determining collector state.
+  G1YoungGCTraceTime tm(this, _gc_cause);
+
+  // JFR
+  G1YoungGCJFRTracerMark jtm(gc_timer_stw(), gc_tracer_stw(), _gc_cause);
+  // JStat/MXBeans
+  G1YoungGCMonitoringScope ms(monitoring_support(),
+                              !collection_set()->candidates()->is_empty() /* all_memory_pools_affected */);
+  // Create the heap printer before internal pause timing to have
+  // heap information printed as last part of detailed GC log.
+  G1HeapPrinterMark hpm(_g1h);
+  // Young GC internal pause timing
+  G1YoungGCNotifyPauseMark npm(this);
+
+  // Verification may use the workers, so they must be set up before.
+  // Individual parallel phases may override this.
+  set_young_collection_default_active_worker_threads();
+
+  // Wait for root region scan here to make sure that it is done before any
+  // use of the STW workers to maximize cpu use (i.e. all cores are available
+  // just to do that).
+  wait_for_root_region_scanning();
+
+  G1YoungGCVerifierMark vm(this);
+  {
+    // Actual collection work starts and is executed (only) in this scope.
+
+    // Young GC internal collection timing. The elapsed time recorded in the
+    // policy for the collection deliberately elides verification (and some
+    // other trivial setup above).
+    policy()->record_young_collection_start();
+
+    pre_evacuate_collection_set(jtm.evacuation_info());
+
+    G1ParScanThreadStateSet per_thread_states(_g1h,
+                                              workers()->active_workers(),
+                                              collection_set(),
+                                              &_evac_failure_regions);
+
+    bool may_do_optional_evacuation = collection_set()->optional_region_length() != 0;
+    // Actually do the work...
+    // 进行三色标记
+    evacuate_initial_collection_set(&per_thread_states, may_do_optional_evacuation);
+
+    if (may_do_optional_evacuation) {
+      evacuate_optional_collection_set(&per_thread_states);
+    }
+    post_evacuate_collection_set(jtm.evacuation_info(), &per_thread_states);
+
+    // Refine the type of a concurrent mark operation now that we did the
+    // evacuation, eventually aborting it.
+    _concurrent_operation_is_full_mark = policy()->concurrent_operation_is_full_mark("Revise IHOP");
+
+    // Need to report the collection pause now since record_collection_pause_end()
+    // modifies it to the next state.
+    jtm.report_pause_type(collector_state()->young_gc_pause_type(_concurrent_operation_is_full_mark));
+
+    policy()->record_young_collection_end(_concurrent_operation_is_full_mark, evacuation_alloc_failed());
+  }
+  TASKQUEUE_STATS_ONLY(_g1h->task_queues()->print_and_reset_taskqueue_stats("Oop Queue");)
+}
+```
+
+```c++
+void G1YoungCollector::evacuate_initial_collection_set(G1ParScanThreadStateSet* per_thread_states,
+                                                      bool has_optional_evacuation_work) {
+  G1GCPhaseTimes* p = phase_times();
+
+  {
+    Ticks start = Ticks::now();
+    rem_set()->merge_heap_roots(true /* initial_evacuation */);
+    p->record_merge_heap_roots_time((Ticks::now() - start).seconds() * 1000.0);
+  }
+
+  Tickspan task_time;
+  const uint num_workers = workers()->active_workers();
+
+  Ticks start_processing = Ticks::now();
+  {
+    G1RootProcessor root_processor(_g1h, num_workers);
+    G1EvacuateRegionsTask g1_par_task(_g1h,
+                                      per_thread_states,
+                                      task_queues(),
+                                      &root_processor,
+                                      num_workers,
+                                      has_optional_evacuation_work);
+    task_time = run_task_timed(&g1_par_task);
+    // Closing the inner scope will execute the destructor for the
+    // G1RootProcessor object. By subtracting the WorkerThreads task from the total
+    // time of this scope, we get the "NMethod List Cleanup" time. This list is
+    // constructed during "STW two-phase nmethod root processing", see more in
+    // nmethod.hpp
+  }
+  Tickspan total_processing = Ticks::now() - start_processing;
+
+  p->record_initial_evac_time(task_time.seconds() * 1000.0);
+  p->record_or_add_nmethod_list_cleanup_time((total_processing - task_time).seconds() * 1000.0);
+
+  rem_set()->complete_evac_phase(has_optional_evacuation_work);
+}
+
+Tickspan G1YoungCollector::run_task_timed(WorkerTask* task) {
+  Ticks start = Ticks::now();
+  workers()->run_task(task);
+  return Ticks::now() - start;
+}
+```
 
 #### 🗑ShenandoahHeap
 
+本算法可以实现并发回收(通过 **转发指针** & **读屏障** )。但由于转发指针的加入需要覆盖所有对象访问的场景，包括读、写、加锁等等，所以需要**同时设置读屏障和写屏障**。
+
+算法采用 **连接矩阵（Connection Matrix）** 替换 g1 中的卡表。
+
+> 1. Init Mark 并发标记的初始化阶段，它为并发标记准备堆和应用线程，然后扫描root集合。这是整个GC生命周期第一次停顿，这个阶段主要工作是root集合扫描，所以停顿时间主要取决于root集合大小。
+> 2. Concurrent Marking 贯穿整个堆，以root集合为起点，跟踪可达的所有对象。 这个阶段和应用程序一起运行，即并发（concurrent）。这个阶段的持续时间主要取决于存活对象的数量，以及堆中对象图的结构。由于这个阶段，应用依然可以分配新的数据，所以在并发标记阶段，堆占用率会上升。
+> 3. Final Mark 清空所有待处理的标记/更新队列，重新扫描root集合，结束并发标记。这个阶段还会搞明白需要被清理（evacuated）的region（即垃圾收集集合），并且通常为下一阶段做准备。最终标记是整个GC周期的第二个停顿阶段，这个阶段的部分工作能在并发预清理阶段完成，这个阶段最耗时的还是清空队列和扫描root集合。
+> 4. Concurrent Cleanup 回收即时垃圾区域 -- 这些区域是指并发标记后，探测不到任何存活的对象。
+> 5. Concurrent Evacuation 从垃圾收集集合中拷贝存活的对到其他的region中，这是有别于OpenJDK其他GC主要的不同点。这个阶段能再次和应用一起运行，所以应用依然可以继续分配内存，这个阶段持续时间主要取决于选中的垃圾收集集合大小（比如整个堆划分128个region，如果有16个region被选中，其耗时肯定超过8个region被选中）。
+> 6. Init Update Refs 初始化更新引用阶段，它除了确保所有GC线程和应用线程已经完成并发Evacuation阶段，以及为下一阶段GC做准备以外，其他什么都没有做。这是整个GC周期中，第三次停顿，也是时间最短的一次。
+> 7. Concurrent Update References 再次遍历整个堆，更新那些在并发evacuation阶段被移动的对象的引用。这也是有别于OpenJDK其他GC主要的不同，这个阶段持续时间主要取决于堆中对象的数量，和对象图结构无关，因为这个过程是线性扫描堆。这个阶段是和应用一起并发运行的。
+> 8. Final Update Refs 通过再次更新现有的root集合完成更新引用阶段，它也会回收收集集合中的region，因为现在的堆已经没有对这些region中的对象的引用。
+
 #### 🗑ZCollectedHeap
+
+##### Region 布局
+
+> 1. 小型Region容量固定为2MB，用于存放小于256KB的对象。
+> 2. 中型Region容量固定为32MB，用于存放大于等于256KB但不足4MB的对象。
+> 3. 大型Region容量为2MB的整数倍，存放4MB及以上大小的对象，而且每个大型Region中只存放一个大对象。由于大对象移动代价过大，所以该对象不会被重分配。
+
+##### ✨读屏障
+
+对比 g1 收集器，ZGC 采用的是读屏障，这使得有机会拦截 Java 代码中对对象的访问，如果访问的对象内存地址因为 gc 被移动，那么可以在拦截的时候注入指针修复操作，如此就不需要通过 STW 完成移动了。
+
+##### ✨指针着色技术
+
+指针着色的意思是借用 64 位指针的一部分**高位**用于标记 地址属于哪块 Region，包含下列三种状态：
+
+> - Mark 0
+> - Mark 1
+> - Remapped  (新产生/被重分配的对象为此初始类型)
+
+在**并发标记**过程中，ZGC 直接在指针上做标记，而非如 g1 一样在对象头部附加信息处做标记，并标记为M0/M1(与 from/to 复制移动一定程度上相似)。
+
+回收过程将发生重分配，即复制存活对象到新 region（此后标记为 remapped），并且为每个 region 维护一个转发表，记录从旧对象到新对象的转向关系。如果此时用户线程访问了重分配集(M0/M1)的对象，即可根据转发表在读屏障下直接修复指针。
+
+一旦 region 所有存活对象一定完成，即可直接释放 region，但暂时保留转发表。
+
+接下来进行重映射，修正整个堆中指向重分配集中旧对象的所有引用，并逐步释放原来的转发表。
+
+在重映射过程中，可以发生第二次并发标记，此次标记为 M1/M0，以此与上次存活对象作区分。
+
+值得注意的是：**M0、M1 在每轮标记中只有一种是活跃的，且此时用户线程创建的新变量为M0/M1其中一种当轮的活跃状态。**
+
+
+
+> 1. 初始标记(Mark Start)：先STW，并记录下gc roots直接引用的对象。
+> 2. 并发标记（Concurrent Mark）：与G1一样，并发标记是遍历对象图可达性分析的阶段，它的初始化标记（Mark Start）和最终标记（Mark End）也会出现短暂的停顿，与G1不同的是，ZGC的标记是在指针上而不是在对象上进行的，标记阶段会更新颜色指针（见下面详解）中的 Marked0、Marked1标志位。记录在指针的好处就是对象回收之后，这块内存就可以立即使用。存在对象上的时候就不能马上使用，因为它上面还存放着一些垃圾回收的信息，需要清理完成之后才能使用。
+> 3. 再标记和非强根并行标记，在并发标记结束后尝试终结标记动作，理论上并发标记结束后所有待标记的对象会全部完成，但是因为GC工作线程和应用程序线程是并发运行，所以可能存在GC工作线程执行结束标记时，应用程序线程又有新的引用关系变化导致漏标记，所以这一步先判断是否真的结束了对象的标记，如果没有结束就还会启动并行标记，所以这一步需要STW。另外，在该步中，还会对非强根（软引用，虚引用等）进行并行标记。
+> 4. 并发预备重分配（Concurrent Prepare for Relocate）：这个阶段需要根据特定的查询条件统计得出本次收集过程要清理那些 Region，将这些 Region组成重分配集（Relocation Set）。ZGC 每次回收都会扫描所有的 Region，用范围更大的扫描成本换取G1中记忆集和维护成本。
+> 5. 初始转移：转移根对象引用的对象，该步需要STW。
+> 6. 并发重分配（Concurrent Relocate）：重分配是 ZGC执行过程中的核心阶段，这个过程要把重分配集中的存活对象复制到新的 Region上，并为重分配集中的每个 Region维护了一个转发表（Forward Table），记录从旧对象到新对象的转换关系。ZGC收集器能仅从引用上就明确得知一个对象是否处于重分配集中，如果用户线程此时并发访问了位于重分配集中的对象，这次访问将会被预置的内存屏障所截获，然后立即根据 Region上的转发表记录将访问转到新复制的对象上，并同时修正更新该引用的值，使其直接指向新对象，ZGC将这种行为称为指针的“自愈”（Self-Healing）能力。
+> 7. 并发重映射（Concurrent Remap)：重映射所做的就是修正整个堆中指向重分配集中旧对象的所有引用，但是ZGC中对象引用存在“自愈”功能，所以这个重映射操作并不是很迫切。ZGC很巧妙地把并发重映射阶段要做的工作，合并到了下一次垃圾收集循环中的并发标记阶段里去完成，反正他们都是要遍历所有对象，这样合并就节省了一次遍历对象图的开销。一旦所有指针都被修正之后，原来记录新旧对象关系的转发表就可以释放掉了。
 
 ## 🖊类加载器
 
